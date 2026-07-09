@@ -23,12 +23,12 @@
 #define FD_SHMEM_JOIN_MODE_READ_ONLY   (0)
 #define FD_SHMEM_JOIN_MODE_READ_WRITE  (1)
 
-/* FD_SHMEM_{NUMA,CPU}_MAX give the maximum number of numa nodes and
-   logical cpus supported by fd_shmem.
-   FD_SHMEM_CPU_MAX>=FD_SHMEM_NUMA_MAX>0. */
+/* FD_SHMEM_NUMA_MAX give the maximum number of numa nodes supported by
+   fd_shmem.
+   The maximum number of logical cps is FD_TILE_MAX.
+   FD_TILE_MAX>=FD_SHMEM_NUMA_MAX>0. */
 
 #define FD_SHMEM_NUMA_MAX (1024UL)
-#define FD_SHMEM_CPU_MAX  (1024UL)
 
 /* FD_SHMEM_{UNKNOWN,NORMAL,HUGE,GIGANTIC}_{PAGE_LG_SZ,PAGE_SZ} give the
    log2 page size / page size on a hosted x86 target.  These are

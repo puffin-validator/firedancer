@@ -733,8 +733,8 @@ fd_shmem_private_boot( int *    pargc,
 
 
   ulong cpu_cnt = fd_shmem_private_cpus.cpu_cnt;
-  if( FD_UNLIKELY( !((1UL<=cpu_cnt) & (cpu_cnt<=FD_SHMEM_CPU_MAX)) ) )
-    FD_LOG_ERR(( "fd_shmem: unexpected cpu_cnt %lu (expected in [1,%lu])", cpu_cnt, FD_SHMEM_CPU_MAX ));
+  if( FD_UNLIKELY( !((1UL<=cpu_cnt) & (cpu_cnt<=FD_TILE_MAX)) ) )
+    FD_LOG_ERR(( "fd_shmem: unexpected cpu_cnt %lu (expected in [1,%lu])", cpu_cnt, FD_TILE_MAX ));
 
   for( ulong cpu_rem=cpu_cnt; cpu_rem; cpu_rem-- ) {
     const ulong cpu_idx  = cpu_rem-1UL;
