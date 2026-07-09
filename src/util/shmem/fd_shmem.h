@@ -292,10 +292,11 @@ FD_FN_PURE ulong fd_shmem_cpu_online_cnt ( void );
 
 FD_FN_PURE ulong fd_shmem_numa_idx( ulong cpu_idx );
 
-/* fd_shmem_cpu_idx returns the smallest cpu_idx of a cpu close to
-   numa_idx.  Given a numa_idx in [0,fd_shmem_numa_cnt()), returns a
-   value in [0,fd_shmem_cpu_cnt()).  Returns ULONG_MAX otherwise.  The
-   numa -> cpu mapping is determined at thread group boot. */
+/* fd_shmem_cpu_idx returns the smallest cpu_idx of an active cpu close
+   to numa_idx.  Given a numa_idx in [0,fd_shmem_numa_cnt()), returns a
+   value in [0,fd_shmem_cpu_cnt()).  Returns ULONG_MAX otherwise, or if
+   no active cpu are in numa node.  The numa -> cpu mapping is
+   determined at thread group boot. */
 
 FD_FN_PURE ulong fd_shmem_cpu_idx( ulong numa_idx );
 

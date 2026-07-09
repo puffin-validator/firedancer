@@ -81,9 +81,14 @@ ulong fd_shmem_private_base_len;                          /* 0UL at ",          
 
 /* NUMA TOPOLOGY APIS *************************************************/
 
-static struct fd_topo_cpus fd_shmem_private_cpus;            /* Zeroed at thread group start, initialized at boot */
-static ulong  fd_shmem_private_cpu_online_cnt;               /* " */
-static ushort fd_shmem_private_cpu_idx[ FD_SHMEM_NUMA_MAX ]; /* " */
+struct fd_numa {
+    int    online;
+    ushort cpu_idx;
+};
+
+static struct fd_topo_cpus fd_shmem_private_cpus;                      /* Zeroed at thread group start, initialized at boot */
+static ulong               fd_shmem_private_cpu_online_cnt;            /* " */
+static struct fd_numa      fd_shmem_private_numa[ FD_SHMEM_NUMA_MAX ]; /* " */
 
 ulong fd_shmem_numa_cnt      ( void )                { return fd_shmem_private_cpus.numa_node_cnt; }
 ulong fd_shmem_cpu_cnt       ( void )                { return fd_shmem_private_cpus.cpu_cnt;  }
@@ -104,8 +109,8 @@ fd_shmem_numa_idx( ulong cpu_idx ) {
 
 ulong
 fd_shmem_cpu_idx( ulong numa_idx ) {
-  if( FD_UNLIKELY( numa_idx>=fd_shmem_private_cpus.numa_node_cnt ) ) return ULONG_MAX;
-  return fd_shmem_private_cpu_idx[ numa_idx ];
+  if( FD_UNLIKELY( numa_idx>=fd_shmem_private_cpus.numa_node_cnt || !fd_shmem_private_numa[numa_idx].online ) ) return ULONG_MAX;
+  return fd_shmem_private_numa[ numa_idx ].cpu_idx;
 }
 
 int
@@ -738,11 +743,14 @@ fd_shmem_private_boot( int *    pargc,
 
   for( ulong cpu_rem=cpu_cnt; cpu_rem; cpu_rem-- ) {
     const ulong cpu_idx  = cpu_rem-1UL;
-    if( FD_LIKELY( fd_shmem_private_cpus.cpu[cpu_idx].online ) ) fd_shmem_private_cpu_online_cnt++;
-    const ulong numa_idx = fd_shmem_private_cpus.cpu[cpu_idx].numa_node;
-    if( FD_UNLIKELY( numa_idx>=FD_SHMEM_NUMA_MAX) )
-      FD_LOG_ERR(( "fd_shmem: unexpected numa idx (%lu) for cpu idx %lu", numa_idx, cpu_idx ));
-    fd_shmem_private_cpu_idx [ numa_idx ] = (ushort)cpu_idx;
+    if( FD_LIKELY( fd_shmem_private_cpus.cpu[cpu_idx].online ) ) {
+      fd_shmem_private_cpu_online_cnt++;
+      const ulong numa_idx = fd_shmem_private_cpus.cpu[cpu_idx].numa_node;
+      if( FD_UNLIKELY( numa_idx>=FD_SHMEM_NUMA_MAX) )
+        FD_LOG_ERR(( "fd_shmem: unexpected numa idx (%lu) for cpu idx %lu", numa_idx, cpu_idx ));
+      fd_shmem_private_numa[numa_idx].online  = 1;
+      fd_shmem_private_numa[numa_idx].cpu_idx = (ushort) cpu_idx;
+    }
   }
 
   /* Determine the shared memory domain for this thread group */
@@ -770,7 +778,7 @@ fd_shmem_private_halt( void ) {
   /* At this point, shared memory is offline */
 
   fd_shmem_private_cpu_online_cnt = 0;
-  fd_memset( fd_shmem_private_cpu_idx, 0, FD_SHMEM_NUMA_MAX );
+  fd_memset( fd_shmem_private_numa, 0, FD_SHMEM_NUMA_MAX * sizeof(struct fd_numa) );
   fd_memset( &fd_shmem_private_cpus,   0, sizeof(fd_shmem_private_cpus) );
 
   fd_shmem_private_base[0] = '\0';
