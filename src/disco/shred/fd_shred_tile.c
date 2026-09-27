@@ -646,17 +646,27 @@ during_frag( fd_shred_ctx_t * ctx,
         just won't send these shreds out and we'll reuse the FEC set for
         the next one.  From a higher level though, if we do get overrun,
         a bunch of shreds will never be transmitted, and we'll end up
-        producing a block that never lands on chain. */
+        producing a block that never lands on chain.
+        PEBBLE:
+        * we force shred sending also if flush is true in the meta,
+        * we accept that such packets do not contain any microblock
+          and carry just a bare flush request. */
 
       uchar const * dcache_entry = fd_chunk_to_laddr_const( ctx->in[ in_idx ].mem, chunk );
       if( FD_UNLIKELY( chunk<ctx->in[ in_idx ].chunk0 || chunk>ctx->in[ in_idx ].wmark || sz>FD_POH_SHRED_MTU ||
-          sz<(sizeof(fd_entry_batch_meta_t)+sizeof(fd_entry_batch_header_t)) ) )
+          (sz != sizeof(fd_entry_batch_meta_t) && sz<(sizeof(fd_entry_batch_meta_t)+sizeof(fd_entry_batch_header_t))) ) )
         FD_LOG_ERR(( "chunk %lu %lu corrupt, not in range [%lu,%lu]", chunk, sz,
               ctx->in[ in_idx ].chunk0, ctx->in[ in_idx ].wmark ));
 
       fd_entry_batch_meta_t const * entry_meta = (fd_entry_batch_meta_t const *)dcache_entry;
       uchar const *                 entry      = dcache_entry + sizeof(fd_entry_batch_meta_t);
-      ulong                         entry_sz   = sz           - sizeof(fd_entry_batch_meta_t);
+      ulong                         entry_sz   = sz           - sizeof(fd_entry_batch_meta_t); /* PEBBLE: may be 0 */
+
+      /* PEBBLE: if it's a bare flush request but we have nothing to flush, do nothing. */
+      if( FD_UNLIKELY( entry_sz==0 && ctx->pending_batch.pos==0 ) ) {
+        ctx->skip_frag = 1;
+        return;
+      }
 
       fd_entry_batch_header_t const * microblock = (fd_entry_batch_header_t const *)entry;
 
@@ -680,6 +690,12 @@ during_frag( fd_shred_ctx_t * ctx,
         ctx->batch_cnt                    = 0UL;
 
         FD_MCNT_INC( SHRED, MICROBLOCK_ABANDONED, 1UL );
+
+        /* PEBBLE: if we are in a bare flush request, do nothing. */
+        if( FD_UNLIKELY( entry_sz==0 ) ) {
+          ctx->skip_frag = 1;
+          return;
+        }
       }
 
       ctx->pending_batch.slot = target_slot;
@@ -760,14 +776,15 @@ during_frag( fd_shred_ctx_t * ctx,
          with the incoming microblock.  If false, no shredding takes
          place, and the microblock is added to the current batch.
          Pack limits entry bytes so this batching cannot exceed
-         max_shred_idx. */
+         max_shred_idx.
+         PEBBLE: honor flush request. */
       int is_marker                = entry_meta->block_complete==-1;
       int writing_marker           = 0;
-      int forced_end_batch         = entry_meta->block_complete | new_slot;
+      int forced_end_batch         = entry_meta->block_complete | new_slot | entry_meta->flush;
       int batch_would_exceed_wmark = ( ctx->pending_batch.pos + entry_sz ) > pending_batch_wmark;
-      int include_in_current_batch = !is_marker && ( forced_end_batch | ( !batch_would_exceed_wmark ) );
+      int include_in_current_batch = !is_marker && ( forced_end_batch | ( !batch_would_exceed_wmark ) )  && entry_sz > 0;
       int process_current_batch    = is_marker ? !!ctx->pending_batch.pos : ( forced_end_batch | batch_would_exceed_wmark );
-      int init_new_batch           = !include_in_current_batch;
+      int init_new_batch           = !include_in_current_batch & (entry_sz > 0);
 
       if( FD_LIKELY( include_in_current_batch ) ) {
         if( FD_UNLIKELY( SHOULD_PROCESS_THESE_SHREDS ) ) {

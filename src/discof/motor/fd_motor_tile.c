@@ -70,6 +70,13 @@ struct fd_motor_tile {
   ulong in_cnt;
   ulong idle_cnt;
 
+  /* PEBBLE: when a FLUSH request is received from pack with a count of
+     in-auction txs, it is saved in in_auction_flush. Motor then sends a
+     FLUSH request to shred when it has received from execle this count
+     of in-auction txs. */
+  uint in_auction_received;
+  uint in_auction_flush;
+
   fd_startup_gate_t startup_gate[1];
 
   int in_kind[ 64 ];

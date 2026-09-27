@@ -46,6 +46,8 @@ struct fd_execle_tile {
   ulong _pack_idx;
   ulong _txn_idx;
   int _is_bundle;
+  int _in_auction; /* PEBBLE */
+
   fd_acct_addr_t _alt_accts[MAX_TXN_PER_MICROBLOCK][FD_TXN_ACCT_ADDR_MAX];
 
   ulong * busy_fseq;
@@ -248,6 +250,7 @@ during_frag( fd_execle_tile_t * ctx,
   ctx->_pack_idx  = trailer->pack_idx;
   ctx->_txn_idx   = trailer->pack_txn_idx;
   ctx->_is_bundle = trailer->is_bundle;
+  ctx->_in_auction = trailer->in_auction; /* PEBBLE */
 }
 
 static void
@@ -302,6 +305,7 @@ handle_microblock( fd_execle_tile_t *  ctx,
   trailer->bank_seq         = bank->bank_seq;
   trailer->exec_start_ticks = exec_start_ticks;
   trailer->exec_end_ticks   = LONG_MAX;
+  trailer->in_auction = ctx->_in_auction; /* PEBBLE */
 
   for( ulong i=0UL; i<txn_cnt; i++ ) {
     fd_txn_p_t *   txn     = (fd_txn_p_t *)( dst + (i*sizeof(fd_txn_p_t)) );
@@ -697,6 +701,8 @@ handle_bundle( fd_execle_tile_t *  ctx,
     trailer->txn_ns_dt.exec_start   = fd_float_if( txn_out->details.exec_start_ticks==LONG_MAX,   trailer->txn_ns_dt.check_start,  (float)fd_long_max( 0L, txn_out->details.exec_start_ticks   - microblock_start_ticks ) * ctx->ns_per_tick );
     trailer->txn_ns_dt.commit_start = fd_float_if( txn_out->details.commit_start_ticks==LONG_MAX, trailer->txn_ns_dt.exec_start,   (float)fd_long_max( 0L, txn_out->details.commit_start_ticks - microblock_start_ticks ) * ctx->ns_per_tick );
     trailer->txn_ns_dt.commit_end   = fd_float_if( txn_end_ticks[ i ]==LONG_MAX,                  trailer->txn_ns_dt.commit_start, (float)fd_long_max( 0L, txn_end_ticks[ i ]                  - microblock_start_ticks ) * ctx->ns_per_tick );
+
+    trailer->in_auction = 0; /* PEBBLE */
 
     ulong new_sz = sizeof(fd_txn_p_t) + sizeof(fd_microblock_trailer_t);
     fd_stem_publish( stem, ctx->out_poh->idx, execle_sig, ctx->out_poh->chunk, new_sz, 0UL, (ulong)fd_frag_meta_ts_comp( microblock_start_ticks ), (ulong)fd_frag_meta_ts_comp( fd_tickcount() ) );

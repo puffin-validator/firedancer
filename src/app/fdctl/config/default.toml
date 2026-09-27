@@ -1380,7 +1380,7 @@ dynamic_port_range = "8900-9000"
         #   When using the perf scheduling mode, there is no reason to
         #   increase the bank tile count beyond the default of 4.
         #
-        #  "balanced" (default)
+        #  "balanced"
         #   Try to fill the block at a rate that is just fast enough to
         #   fill it by the end.  This strategy optimizes for revenue
         #   from priority fees, but can result in blocks that are not
@@ -1390,10 +1390,41 @@ dynamic_port_range = "8900-9000"
         #   When using the balanced mode, there is no reason to increase
         #   bank tile count beyond the default of 4.
         #
-        # In cases of network congestion, high volume, or if seeing poor
-        # block packing performance for any reason, it is recommended to
-        # revert to the "balanced" strategy.
-        schedule_strategy = "balanced"
+        #  "pebble" (default)
+        #   Conduct periodic auctions for non-vote, non-bundled
+        #   transactions.
+        #
+        #   When using the pebble mode, at least 3 bank tiles are
+        #   recommended. The default 4 is fine, but when synchronizing
+        #   with Jito auctions, more banks will allow to start the last
+        #   auction later, and thus to have more bundles succeeding.
+        schedule_strategy = "pebble"
+
+        #  When using the pebble mode, auctions are held periodically.
+
+        #  If auctions_per_slot is non 0, there will be exactly
+        #  this count of auctions per slot.
+        #  With a slot duration of 350ms and 7 auctions per slot
+        #  one auction will be held every 50ms.
+        #
+        #  If auctions_per_slot is 0, the auctions are synchronized
+        #  with Jito auction. The bundle tile must be enabled and
+        #  connected to a Jito Block engine.
+        #  At the very end of the slot, a last auction
+        #  is held with all available banks to maximize the total amount
+        #  of CU packed (like the old revenue strategy).
+        #  It is beneficial to also configure
+        #  `additional_shred_destinations_leader` to directly send the
+        #  shreds to the Jito BE, to increase the odds that the next
+        #  bundles received will have not been simulated and selected
+        #  against an old state.
+        auctions_per_slot = 4
+
+        # Speed of execution by banks as a number of nanoseconds per
+        # CU. It depends on the hardware, and whether the bank tiles
+        # have a dedicated core or are paired with another tile with
+        # SMT.
+        ns_per_cu = 9.0
 
         # If the pack tile receives a transaction that reads from or
         # writes to an address in the account_blocklist, it will reject

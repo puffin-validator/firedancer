@@ -256,6 +256,8 @@ fd_config_extract_pod( uchar *       pod,
   CFG_POP      ( bool,   tiles.pack.use_consumed_cus                      );
   CFG_POP      ( cstr,   tiles.pack.schedule_strategy                     );
   CFG_POP_ARRAY( cstr,   tiles.pack.account_blocklist                     );
+  CFG_POP      ( ulong,  tiles.pack.auctions_per_slot                     ); /* PEBBLE */
+  CFG_POP      ( float,  tiles.pack.ns_per_cu                             );
 
   CFG_POP      ( ulong,  tiles.replay.max_transaction_lookahead_buffer_size );
   CFG_POP_ARRAY( cstr,   tiles.replay.enable_features                       );
