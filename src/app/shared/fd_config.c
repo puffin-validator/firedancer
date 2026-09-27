@@ -382,6 +382,7 @@ fd_config_fill( fd_config_t * config,
   else if( FD_LIKELY( !strcmp( config->tiles.pack.schedule_strategy, "revenue"  ) ) ) {
     FD_LOG_ERR(( "the revenue scheduler has been removed.  Please update [tiles.pack.schedule_strategy]" ));
   }
+  else if( FD_LIKELY( !strcmp( config->tiles.pack.schedule_strategy, "pebble"  ) ) ) config->tiles.pack.schedule_strategy_enum = 2;
   else FD_LOG_ERR(( "[tiles.pack.schedule_strategy] %s not recognized", config->tiles.pack.schedule_strategy ));
 
   fd_config_fill_net( config );
@@ -648,6 +649,15 @@ fd_config_validate( fd_config_t const * config ) {
   CFG_HAS_NON_EMPTY( development.bench.affinity );
 
   CFG_HAS_NON_ZERO( development.bundle.ssl_heap_size_mib );
+
+  if( config->tiles.pack.ns_per_cu<=0.0f) {
+    FD_LOG_ERR(( "`tiles.pack.ns_per_cu` must be > 0.0" ));
+  }
+  if( !config->tiles.bundle.enabled &&
+       config->tiles.pack.schedule_strategy_enum==2 &&
+       config->tiles.pack.auctions_per_slot==0 ) {
+    FD_LOG_ERR(( "`tiles.pack.auctions_per_slot` cannot be 0 if bundles are disabled" ));
+  }
 }
 
 #undef CFG_HAS_NON_EMPTY

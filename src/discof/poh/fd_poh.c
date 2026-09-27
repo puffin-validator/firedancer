@@ -273,6 +273,10 @@ fd_poh_begin_leader( fd_poh_t * poh,
     table->cnt  = 0UL;
   }
 
+  /* PEBBLE */
+  poh->in_auction_flush = 0U;
+  poh->in_auction_received = 0U;
+
   FD_LOG_INFO(( "begin_leader(slot=%lu, last_slot=%lu, last_hashcnt=%lu)", slot, poh->last_slot, poh->last_hashcnt ));
 }
 
@@ -301,6 +305,20 @@ void
 fd_poh_wfs_done( fd_poh_t * poh ) {
   poh->wfs_paused = 0;
   poh->reset_slot_start_ns = fd_log_wallclock();
+}
+
+/* PEBBLE */
+void
+fd_poh_flush_request_received( fd_poh_t *          poh,
+                               fd_stem_context_t * stem,
+                               uint                in_auction_cnt,
+                               ulong               slot16 ) {
+  if( FD_UNLIKELY( poh->state!=STATE_LEADER || (poh->slot&0xFFFFUL)!=slot16 ) ) return;
+
+  if( FD_UNLIKELY( in_auction_cnt==poh->in_auction_received ) )
+    fd_poh_publish_flush(poh, stem);
+  else if( FD_LIKELY( in_auction_cnt>poh->in_auction_received ) )
+    poh->in_auction_flush = in_auction_cnt; /* flush when the count is reached */
 }
 
 void
@@ -368,6 +386,7 @@ publish_tick( fd_poh_t *          poh,
     meta->reference_tick = hashcnt/poh->hashcnt_per_tick;
     meta->block_complete = hashcnt==poh->hashcnt_per_slot;
   }
+  meta->flush = 0; /* PEBBLE */
 
   meta->parent_block_id_valid = 1;
   fd_memcpy( meta->parent_block_id, poh->completed_block_id, 32UL );
@@ -695,13 +714,15 @@ publish_microblock( fd_poh_t *          poh,
                     ulong               slot,
                     ulong               hashcnt_delta,
                     ulong               txn_cnt,
-                    fd_txn_p_t const *  txns ) {
+                    fd_txn_p_t const *  txns,
+                    uchar               flush ) {
   uchar * dst = (uchar *)fd_chunk_to_laddr( poh->shred_out->mem, poh->shred_out->chunk );
   FD_TEST( slot>=poh->reset_slot );
   fd_entry_batch_meta_t * meta = (fd_entry_batch_meta_t *)dst;
   meta->parent_offset = 1UL+slot-poh->reset_slot;
   meta->reference_tick = (poh->hashcnt/poh->hashcnt_per_tick) % poh->ticks_per_slot;
   meta->block_complete = !poh->hashcnt;
+  meta->flush = flush; /* PEBBLE */
 
   meta->parent_block_id_valid = 1;
   fd_memcpy( meta->parent_block_id, poh->completed_block_id, 32UL );
@@ -736,6 +757,28 @@ publish_microblock( fd_poh_t *          poh,
   poh->shred_out->chunk = fd_dcache_compact_next( poh->shred_out->chunk, sz, poh->shred_out->chunk0, poh->shred_out->wmark );
 }
 
+/* PEBBLE: same as `publish_microblock`, but publish only a
+   batch_meta with a flush request, without microblock. */
+void
+fd_poh_publish_flush( fd_poh_t *          poh,
+                      fd_stem_context_t * stem ) {
+  uchar * dst = (uchar *)fd_chunk_to_laddr( poh->shred_out->mem, poh->shred_out->chunk );
+  fd_entry_batch_meta_t * meta = (fd_entry_batch_meta_t *)dst;
+  meta->parent_offset = 1UL+poh->slot-poh->reset_slot;
+  meta->reference_tick = (poh->hashcnt/poh->hashcnt_per_tick) % poh->ticks_per_slot;
+  meta->block_complete = 0;
+  meta->flush = 1;
+
+  meta->parent_block_id_valid = 1;
+  fd_memcpy( meta->parent_block_id, poh->completed_block_id, 32UL );
+
+  ulong tspub = (ulong)fd_frag_meta_ts_comp( fd_tickcount() );
+  ulong sz = sizeof(fd_entry_batch_meta_t);
+  ulong new_sig = fd_disco_poh_sig( poh->slot, POH_PKT_TYPE_MICROBLOCK, 0UL );
+  fd_stem_publish( stem, poh->shred_out->idx, new_sig, poh->shred_out->chunk, sz, 0UL, 0UL, tspub );
+  poh->shred_out->chunk = fd_dcache_compact_next( poh->shred_out->chunk, sz, poh->shred_out->chunk0, poh->shred_out->wmark );
+}
+
 void
 fd_poh1_mixin( fd_poh_t *                         poh,
                fd_stem_context_t *                stem,
@@ -743,7 +786,8 @@ fd_poh1_mixin( fd_poh_t *                         poh,
                uchar const *                      hash,
                ulong                              txn_cnt,
                fd_txn_p_t const *                 txns,
-               fd_leader_txn_timing_rec_t const * timing ) {
+               fd_leader_txn_timing_rec_t const * timing,
+               int                                in_auction ) {
   if( FD_UNLIKELY( slot!=poh->next_leader_slot || slot!=poh->slot ) ) {
     FD_LOG_ERR(( "packed too early or late slot=%lu, current_slot=%lu", slot, poh->slot ));
   }
@@ -752,6 +796,17 @@ fd_poh1_mixin( fd_poh_t *                         poh,
   FD_TEST( poh->state==STATE_LEADER );
   FD_TEST( poh->microblocks_lower_bound<poh->max_microblocks_per_slot );
   poh->microblocks_lower_bound += 1UL;
+
+  /* PEBBLE: if the microblock contains an in-auction tx, check if it's
+     the last of the auction. If yes we request a flush from the shred
+     tile. */
+  uchar flush = 0;
+  if( FD_LIKELY( in_auction ) ) {
+    poh->in_auction_received++;
+    if( FD_UNLIKELY( poh->in_auction_received == poh->in_auction_flush ) ) {
+      flush = 1;
+    }
+  }
 
   ulong executed_txn_cnt = 0UL;
   for( ulong i=0UL; i<txn_cnt; i++ ) {
@@ -768,7 +823,15 @@ fd_poh1_mixin( fd_poh_t *                         poh,
      transactions failed to execute, the microblock would be empty,
      causing agave to think it's a tick and complain.  Instead, we just
      skip the microblock and don't hash or update the hashcnt. */
-  if( FD_UNLIKELY( !executed_txn_cnt ) ) return;
+  if( FD_UNLIKELY( !executed_txn_cnt ) ) {
+    /* PEBBLE: if the failed txs was the last of an auction, and since
+       we won't publish a microblock, publish a bare flush request
+       instead. */
+    if( FD_UNLIKELY( flush ) ) {
+      fd_poh_publish_flush( poh, stem );
+    }
+    return;
+  }
 
   if( FD_LIKELY( poh->timing_tables ) ) {
     fd_leader_txn_timing_table_t * table = &poh->timing_tables[ poh->timing_table_idx ];
@@ -816,5 +879,5 @@ fd_poh1_mixin( fd_poh_t *                         poh,
     }
   }
 
-  publish_microblock( poh, stem, slot, hashcnt_delta, txn_cnt, txns );
+  publish_microblock( poh, stem, slot, hashcnt_delta, txn_cnt, txns, flush );
 }

@@ -151,6 +151,18 @@ returnable_frag( fd_poh_tile_t *     ctx,
     return 0;
   }
 
+  /* PEBBLE: when a FLUSH request is received from pack with a count of
+     in-auction microblocks, either publish a bare
+     flush request to shred if we already received from execle this
+     count of in-auction microblocks (unlikely), or store this count and
+     request later a flush when we receive this count of microblocks. */
+  if( FD_UNLIKELY( sig>=FD_PACK_MSG_FLUSH && ctx->in_kind[ in_idx ]==IN_KIND_PACK ) ) {
+    const uint  in_auction_cnt = fd_disco_poh_sig_flush_cnt( sig );
+    const ulong slot16         = fd_disco_poh_sig_flush_slot16( sig );
+    fd_poh_flush_request_received( ctx->poh, stem, in_auction_cnt, slot16 );
+    return 0;
+  }
+
   if( FD_UNLIKELY( sig==REPLAY_SIG_WFS_DONE && ctx->in_kind[ in_idx ]==IN_KIND_REPLAY ) ) {
     fd_poh_wfs_done( ctx->poh );
     ctx->idle_cnt = 0UL;
@@ -195,7 +207,7 @@ returnable_frag( fd_poh_tile_t *     ctx,
      It's fine to block pack/execles here, because the skipped ticks
      will be published in the immediate after_credit iterations. */
   if( FD_UNLIKELY( ctx->in_kind[ in_idx ]==IN_KIND_EXECLE && fd_poh_must_publish_skipped_tick( ctx->poh ) ) ) return 1;
-  if( FD_LIKELY( ctx->in_kind[ in_idx ]==IN_KIND_EXECLE || ctx->in_kind[ in_idx ]==IN_KIND_PACK ) ) {
+  if( FD_LIKELY( ctx->in_kind[ in_idx ]==IN_KIND_EXECLE || ( ctx->in_kind[ in_idx ]==IN_KIND_PACK && sig < FD_PACK_MSG_FLUSH ) ) ) {  /* PEBBLE: not a FLUSH request */
     uint pack_idx = (uint)fd_disco_execle_sig_pack_idx( sig );
     if( FD_UNLIKELY( ((int)(pack_idx-ctx->expect_pack_idx))<0L ) ) FD_LOG_ERR(( "received out of order pack_idx %u (expecting %u)", pack_idx, ctx->expect_pack_idx ));
     if( FD_UNLIKELY( pack_idx!=ctx->expect_pack_idx ) ) return 1;
@@ -230,7 +242,7 @@ returnable_frag( fd_poh_tile_t *     ctx,
         .dispatched_ticks = trailer->exec_start_ticks,
         .replayed_ticks   = trailer->exec_end_ticks,
       };
-      fd_poh1_mixin( ctx->poh, stem, target_slot, trailer->hash, txn_cnt, txns, &timing );
+      fd_poh1_mixin( ctx->poh, stem, target_slot, trailer->hash, txn_cnt, txns, &timing, trailer->in_auction );
       break;
     }
     default: {

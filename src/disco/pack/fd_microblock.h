@@ -28,7 +28,11 @@ struct fd_entry_batch_meta {
   /* Whether this is the last microblock in the slot or not.  The last
      microblock will always be an empty tick with no transactions in
      it. */
-  int   block_complete;
+   schar block_complete;
+
+   /* PEBBLE: whether to send the shreds after processing this entry
+      batch. */
+   uchar flush;
 
   /* Chained merkle root needed by shred tile.  This is the merkle
      root of the last FEC set of the parent block (that's used as

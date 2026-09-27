@@ -456,6 +456,13 @@ struct __attribute__((aligned(FD_POH_ALIGN))) fd_poh_private {
   ulong last_slot;
   ulong last_hashcnt;
 
+  /* PEBBLE: when a FLUSH request is received from pack with a count of
+     in-auction txs, it is saved in in_auction_flush. Poh must send a
+     FLUSH request to shred when it has received from execle this count
+     of in-auction txs. */
+  uint in_auction_received;
+  uint in_auction_flush;
+
   /* The PoH tile must never drop microblocks that get committed by the
      bank, so it needs to always be able to mixin a microblock hash.
      Mixing in requires incrementing the hashcnt, so we need to ensure
@@ -568,6 +575,18 @@ fd_poh_advance( fd_poh_t *          poh,
                 int *               opt_poll_in,
                 int *               charge_busy );
 
+/* PEBBLE */
+void
+fd_poh_publish_flush( fd_poh_t *          poh,
+                      fd_stem_context_t * stem );
+
+/* PEBBLE */
+void
+fd_poh_flush_request_received( fd_poh_t *          poh,
+                               fd_stem_context_t * stem,
+                               uint                in_auction_cnt,
+                               ulong               slot16 );
+
 void
 fd_poh1_mixin( fd_poh_t *                         poh,
                fd_stem_context_t *                stem,
@@ -575,7 +594,8 @@ fd_poh1_mixin( fd_poh_t *                         poh,
                uchar const *                      hash,
                ulong                              txn_cnt,
                fd_txn_p_t const *                 txns,
-               fd_leader_txn_timing_rec_t const * timing );
+               fd_leader_txn_timing_rec_t const * timing,
+               int                                in_auction );
 
 void
 fd_poh_wfs_done( fd_poh_t * poh );

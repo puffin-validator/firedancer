@@ -26,6 +26,7 @@ typedef struct {
   ulong _pack_idx;
   ulong _txn_idx;
   int _is_bundle;
+  int _in_auction; /* PEBBLE */
 
   fd_acct_addr_t _alt_accts[MAX_TXN_PER_MICROBLOCK][FD_TXN_ACCT_ADDR_MAX];
 
@@ -144,6 +145,7 @@ during_frag( fd_bank_ctx_t * ctx,
   ctx->_pack_idx = trailer->pack_idx;
   ctx->_txn_idx = trailer->pack_txn_idx;
   ctx->_is_bundle = trailer->is_bundle;
+  ctx->_in_auction = trailer->in_auction; /* PEBBLE */
 }
 
 static void
@@ -362,6 +364,8 @@ handle_microblock( fd_bank_ctx_t *     ctx,
   trailer->exec_end_ticks         = 0L;
 
 
+  trailer->in_auction = ctx->_in_auction; /* PEBBLE */
+
   /* When sending MAX_TXN_PER_MICROBLOCK transactions as fd_txn_p_t to PoH,
      there's always extra bytes at the end to stash the trailer. */
   FD_STATIC_ASSERT( MAX_MICROBLOCK_SZ-(MAX_TXN_PER_MICROBLOCK*sizeof(fd_txn_p_t))>=sizeof(fd_microblock_trailer_t), poh_shred_mtu );
@@ -548,6 +552,8 @@ handle_bundle( fd_bank_ctx_t *     ctx,
     trailer->txn_ns_dt.commit_end   = (float)fd_long_max( 0L, fd_tickcount()       - microblock_start_ticks ) * ctx->ns_per_tick;
     trailer->exec_start_ticks       = 0L;
     trailer->exec_end_ticks         = 0L;
+
+    trailer->in_auction = 0; /* PEBBLE */
 
     ulong new_sz = sizeof(fd_txn_p_t) + sizeof(fd_microblock_trailer_t);
     fd_stem_publish( stem, 0UL, bank_sig, ctx->out_chunk, new_sz, 0UL, 0UL, (ulong)fd_frag_meta_ts_comp( tickcount ) );

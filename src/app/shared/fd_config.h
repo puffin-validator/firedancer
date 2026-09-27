@@ -481,6 +481,10 @@ struct fd_config {
       int   schedule_strategy_enum;
       ulong account_blocklist_cnt;
       char  account_blocklist[ FD_PACK_ACCT_BLOCKLIST_MAX ][ FD_BASE58_ENCODED_32_SZ ];
+      /* PEBBLE: 0 if syncing auction with Jito BE,
+         else number of auctions per slot. */
+      ulong auctions_per_slot;
+      float ns_per_cu;
     } pack;
 
     struct {
