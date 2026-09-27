@@ -12,7 +12,7 @@
    or knowingly skipped) before the constant is bumped.  String keys of
    the user's own file are separately forced through the classification
    lists below. */
-FD_STATIC_ASSERT( sizeof(fd_config_t)==26563824UL, update_fd_config_to_json_for_the_layout_change );
+FD_STATIC_ASSERT( sizeof(fd_config_t)==26563840UL, update_fd_config_to_json_for_the_layout_change );
 
 #define REDACTED "[redacted]"
 
@@ -173,6 +173,8 @@ static char const * const jw_reported_keys[] = {
   "tiles.bundle.tip_payment_program_addr",
   "tiles.bundle.tip_distribution_authority",
   "tiles.pack.schedule_strategy",
+  "tiles.pack.auctions_per_slot",
+  "tiles.pack.ns_per_cu",
   "tiles.pack.account_blocklist",
   "tiles.replay.enable_features",
   "development.core_dump",

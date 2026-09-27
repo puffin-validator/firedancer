@@ -181,8 +181,9 @@ before_frag( fd_guih_ctx_t * ctx,
              ulong          sig ) {
   (void)seq;
 
-  /* Ignore "done draining banks" and "reduce microblock bound" signals from pack->poh */
-  if( FD_LIKELY( ctx->in_kind[ in_idx ]==IN_KIND_PACK_POH && (sig==FD_PACK_MSG_DONE_DRAINING || sig==FD_PACK_MSG_REDUCE_MB_BOUND) ) ) return 1;
+  /* Ignore "done draining banks" and "reduce microblock bound" signals from pack->poh.
+     PEBBLE: also ignore "flush" signals. */
+  if( FD_LIKELY( ctx->in_kind[ in_idx ]==IN_KIND_PACK_POH && sig>=FD_PACK_MSG_FLUSH ) ) return 1;
 
   return 0;
 }
