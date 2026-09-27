@@ -26,6 +26,11 @@
    show 2 FEC sets before the watermark (W), which indicates where to
    close the current batch, as well as 2 extra FEC sets available for
    the last batch in the block.
+   PEBBLE: a microblock carrying a flush request is also included
+   irrespective of how full the batch is, and closes the batch.
+   Such a batch is chained (not resigned) and can use up to
+   ceil((8+WMARK_CHAINED+max_microblock_sz)/C) = 3 FEC sets,
+   still within FD_SHRED_BATCH_FEC_SETS_MAX.
 
      Normal: (to be deprecated)
        +------------+------------+~~~~~~~~~~~+~~~~~~~~~~~~+
@@ -75,7 +80,9 @@ FD_STATIC_ASSERT( ( FD_SHRED_BATCH_FEC_SETS_EXTRA * FD_SHREDDER_RESIGNED_FEC_SET
    watermark, since all remaining FEC sets need to be generated and
    forwarded at once.  The watermark is relative to the beginning
    of the payload in the pending batch buffer (i.e. excluding the
-   8 bytes needed for microblock_cnt in the batch header). */
+   8 bytes needed for microblock_cnt in the batch header).
+   PEBBLE: a microblock carrying a flush request is also allowed
+   to cross the watermark. */
 #define FD_SHRED_BATCH_WMARK_NORMAL   ( FD_SHRED_BATCH_FEC_SETS_WMARK * FD_SHREDDER_NORMAL_FEC_SET_PAYLOAD_SZ   - 8UL )
 #define FD_SHRED_BATCH_WMARK_CHAINED  ( FD_SHRED_BATCH_FEC_SETS_WMARK * FD_SHREDDER_CHAINED_FEC_SET_PAYLOAD_SZ  - 8UL )
 #define FD_SHRED_BATCH_WMARK_RESIGNED ( FD_SHRED_BATCH_FEC_SETS_WMARK * FD_SHREDDER_RESIGNED_FEC_SET_PAYLOAD_SZ - 8UL )

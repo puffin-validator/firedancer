@@ -81,6 +81,13 @@ struct fd_motor_tile {
   ulong                          timing_table_idx;
   ulong                          timing_table_max; /* records per table */
 
+  /* PEBBLE: when a FLUSH request is received from pack with a count of
+     in-auction txs, it is saved in in_auction_flush. Motor then sends a
+     FLUSH request to shred when it has received from execle this count
+     of in-auction txs. */
+  uint in_auction_received;
+  uint in_auction_flush;
+
   fd_startup_gate_t startup_gate[1];
 
   int in_kind[ 64 ];
@@ -177,11 +184,13 @@ static void
 publish_shred( fd_motor_tile_t *   ctx,
                fd_stem_context_t * stem,
                ulong               payload_sz,
-               int                 block_complete ) {
+               schar               block_complete,
+               uchar               flush ) {
   fd_entry_batch_meta_t * meta = fd_chunk_to_laddr( ctx->shred_out->mem, ctx->shred_out->chunk );
   meta->parent_offset          = ctx->slot - ctx->parent_slot;
   meta->reference_tick         = 0UL; /* Alpenglow blocks have no tick schedule */
   meta->block_complete         = block_complete;
+  meta->flush                  = flush; /* PEBBLE: block_complete must be 0 if flush is 1 */
 
   memcpy( meta->parent_block_id, ctx->parent_cmr.uc, sizeof(fd_hash_t) );
   meta->parent_block_id_valid = 1;
@@ -200,6 +209,10 @@ init_block( fd_motor_tile_t *          ctx,
   ctx->slot     = became_leader->slot;
   ctx->poh_hash = ctx->parent_alpentick;
 
+  /* PEBBLE */
+  ctx->in_auction_flush = 0U;
+  ctx->in_auction_received = 0U;
+
   if( FD_LIKELY( ctx->timing_tables ) ) {
     ctx->timing_table_idx ^= 1UL;
     fd_leader_txn_timing_table_t * table = fd_leader_txn_timing_table( ctx->timing_tables, ctx->timing_table_idx, ctx->timing_table_max );
@@ -207,15 +220,15 @@ init_block( fd_motor_tile_t *          ctx,
     table->cnt  = 0UL;
   }
 
-  publish_shred( ctx, stem, prepare_header( ctx ), -1 );
+  publish_shred( ctx, stem, prepare_header( ctx ), -1, 0 );
 }
 
 static void
 fini_block( fd_motor_tile_t *                 ctx,
             fd_stem_context_t *               stem,
             fd_replay_leader_footer_t const * footer ) {
-  publish_shred( ctx, stem, prepare_footer( ctx, footer ), -1 );
-  publish_shred( ctx, stem, prepare_alpentick( ctx ), 1 );
+  publish_shred( ctx, stem, prepare_footer( ctx, footer ), -1, 0 );
+  publish_shred( ctx, stem, prepare_alpentick( ctx ), 1, 0 );
 }
 
 static void
@@ -306,7 +319,11 @@ before_frag( fd_motor_tile_t * ctx,
                                  sig==REPLAY_SIG_BECAME_LEADER ||
                                  sig==REPLAY_SIG_LEADER_FOOTER );
   case IN_KIND_PACK:
+    /* PEBBLE: FLUSH requests only carry the low 16 bits of the slot.
+       DONE_DRAINING and REDUCE_MB_BOUND stay filtered. */
     if( FD_UNLIKELY( sig==FD_PACK_MSG_DONE_DRAINING || sig==FD_PACK_MSG_REDUCE_MB_BOUND ) ) return 1;
+    if( FD_UNLIKELY( sig>=FD_PACK_MSG_FLUSH ) )
+        return fd_disco_poh_sig_flush_slot16( sig )!=(ctx->slot & 0xFFFFUL);
     __attribute__((fallthrough));
   case IN_KIND_EXECLE: {
     ulong slot = fd_disco_execle_sig_slot( sig );
@@ -334,6 +351,21 @@ returnable_frag( fd_motor_tile_t *   ctx,
   (void)tspub;
 
   fd_startup_gate_busy( ctx->startup_gate );
+
+  /* PEBBLE: when a FLUSH request is received from pack with a count of
+     in-auction microblocks, either publish a bare
+     flush request to shred if we already received from execle this
+     count of in-auction microblocks (unlikely), or store this count and
+     request later a flush when we receive this count of microblocks. */
+  if( FD_UNLIKELY( sig>=FD_PACK_MSG_FLUSH && ctx->in_kind[ in_idx ]==IN_KIND_PACK ) ) {
+    const uint in_auction_cnt = fd_disco_poh_sig_flush_cnt( sig );
+    if( FD_UNLIKELY( in_auction_cnt==ctx->in_auction_received ) ) {
+      publish_shred( ctx, stem, 0UL, 0, 1 );
+    } else if( FD_LIKELY( in_auction_cnt>ctx->in_auction_received ) ) {
+      ctx->in_auction_flush = in_auction_cnt; /* Flush when we reach the count */
+    }
+    return 0;
+  }
 
   if( FD_UNLIKELY( chunk<ctx->in[ in_idx ].chunk0 || chunk>ctx->in[ in_idx ].wmark || sz>ctx->in[ in_idx ].mtu ) )
     FD_LOG_ERR(( "chunk %lu %lu corrupt, not in range [%lu,%lu]", chunk, sz, ctx->in[ in_idx ].chunk0, ctx->in[ in_idx ].wmark ));
@@ -373,8 +405,20 @@ returnable_frag( fd_motor_tile_t *   ctx,
       ulong txn_cnt = (sz-sizeof(fd_microblock_trailer_t))/sizeof(fd_txn_p_t);
       fd_txn_p_t const * txns = fd_chunk_to_laddr_const( ctx->in[ in_idx ].mem, chunk );
       fd_microblock_trailer_t const * trailer = fd_type_pun_const( (uchar const *)txns+sz-sizeof(fd_microblock_trailer_t) );
+      /* PEBBLE: if the microblock contains an in-auction tx, check if it's
+         the last of the auction. If yes we request a flush from the shred
+         tile. */
+      uchar flush = 0;
+      if( FD_LIKELY( trailer->in_auction ) ) {
+        ctx->in_auction_received++;
+        if( FD_UNLIKELY( ctx->in_auction_received==ctx->in_auction_flush ) ) {
+          flush = 1;
+        }
+      }
       ulong payload_sz = prepare_entry( ctx, trailer, txn_cnt, txns );
-      if( FD_LIKELY( payload_sz ) ) publish_shred( ctx, stem, payload_sz, 0 );
+      /* PEBBLE: still publish a flush even if no tx were executed
+         successfully. */
+      if( FD_LIKELY( payload_sz || flush ) ) publish_shred( ctx, stem, payload_sz, 0, flush );
       break;
     }
     default: {

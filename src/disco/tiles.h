@@ -147,13 +147,13 @@ struct fd_microblock_trailer {
      (LONG_MAX if nothing committed). */
   long exec_start_ticks;
   long exec_end_ticks;
+
+  /* PEBBLE: true if the microblock contains at least one tx that was
+     scheduled as part of an auction. Those microblocks are counted
+     pack-side and poh-side to determine when to flush the shreds. */
+  int in_auction;
 };
 typedef struct fd_microblock_trailer fd_microblock_trailer_t;
-
-/* Sentinel sig values for messages on the pack_poh.  Normal
-   done_packing messages use fd_disco_execle_sig( slot, pack_idx ). */
-#define FD_PACK_MSG_DONE_DRAINING   (ULONG_MAX)
-#define FD_PACK_MSG_REDUCE_MB_BOUND (ULONG_MAX-1UL)
 
 #define FD_PACK_END_SLOT_REASON_TIME       (1)
 #define FD_PACK_END_SLOT_REASON_MICROBLOCK (2)
@@ -213,6 +213,11 @@ struct fd_microblock_execle_trailer {
      conflicting transactions that should be executed in order, and
      all either commit or fail atomically. */
   int is_bundle;
+
+  /* PEBBLE: true if the microblock contains at least one tx that was
+     scheduled as part of an auction. Those microblocks are counted
+     pack-side and poh-side to determine when to flush the shreds. */
+  int in_auction;
 };
 typedef struct fd_microblock_execle_trailer fd_microblock_execle_trailer_t;
 
