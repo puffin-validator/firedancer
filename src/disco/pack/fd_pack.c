@@ -128,7 +128,8 @@ FD_STATIC_ASSERT( offsetof( fd_pack_ord_txn_t, txn_e->txnp  )==0UL, fd_pack_ord_
 #define FD_ORD_TXN_ROOT_PENDING         1
 #define FD_ORD_TXN_ROOT_PENDING_VOTE    2
 #define FD_ORD_TXN_ROOT_PENDING_BUNDLE  3
-#define FD_ORD_TXN_ROOT_PENALTY( idx ) (4 | (idx)<<8)
+#define FD_ORD_TXN_ROOT_PENDING_LATE    4 /* PEBBLE */
+#define FD_ORD_TXN_ROOT_PENALTY( idx ) (5 | (idx)<<8)
 
 /* if root & TAG_MASK == PENALTY, then PENALTY_ACCT_IDX(root) gives the index
    in the transaction's list of account addresses of which penalty treap the
@@ -248,7 +249,6 @@ typedef struct fd_pack_wcost_ele fd_pack_wcost_ele_t;
 #define TREAP_OPTIMIZE_ITERATION 1
 #define TREAP_LT        COMPARE_WORSE
 #include "../../util/tmpl/fd_treap.c"
-
 
 #define MAP_NAME              sig2txn
 #define MAP_OPTIMIZE_RANDOM_ACCESS_REMOVAL 1
@@ -588,6 +588,10 @@ struct fd_pack_private {
   ulong      cumulative_block_cost;
   ulong      cumulative_vote_cost;
 
+  /* PEBBLE: unlike cumulative_block_cost, doesn't include the CU
+     budgets of txs scheduled but not executed yet. */
+  ulong      cumulative_consumed;
+
   /* expire_before: Any transactions with expires_at strictly less than
      the current expire_before are removed from the available pending
      transaction.  Here, "expire" is used as a verb: cause all
@@ -614,6 +618,19 @@ struct fd_pack_private {
   treap_t pending[1];
   treap_t pending_votes[1];
   treap_t pending_bundles[1];
+
+  /* PEBBLE: non-vote txns that arrived after auction_cutoff_ns.  Not
+     schedulable until fd_pack_auction_end merges them into pending.
+     A simpler double-linked list would do, but we need priority
+     ordering for delete_worst. */
+  treap_t            pending_late[1];
+  fd_pack_smallest_t pending_late_smallest[1];
+
+  /* 0 if no auction is active, 1 if a normal auction is ongoing, and 2
+     if the final "all-in" auction in Jito-mode has started. */
+  int                auction_ongoing;
+  /* Txs arriving after this time are parked in pending_late treap */
+  long               auction_cutoff_ns;
 
   /* penalty_treaps: an fd_map_dynamic mapping hotly contended account
      addresses to treaps of transactions that write to them.  We try not
@@ -882,6 +899,7 @@ fd_pack_new( void                   * mem,
   memset( pack->sched_results, 0, sizeof(pack->sched_results) );
   pack->rng                         = rng;
   pack->cumulative_block_cost       = 0UL;
+  pack->cumulative_consumed         = 0UL; /* PEBBLE */
   pack->cumulative_vote_cost        = 0UL;
   pack->expire_before               = 0UL;
   pack->outstanding_microblock_mask = 0UL;
@@ -914,11 +932,17 @@ fd_pack_new( void                   * mem,
   treap_new( (void*)pack->pending,         pack_depth+extra_depth );
   treap_new( (void*)pack->pending_votes,   pack_depth+extra_depth );
   treap_new( (void*)pack->pending_bundles, pack_depth+extra_depth );
+  treap_new( (void*)pack->pending_late,    pack_depth+extra_depth );
+
+  pack->auction_cutoff_ns = LONG_MAX;
+  pack->auction_ongoing   = FD_PACK_AUCTION_NONE;
 
   pack->pending_smallest->cus         = ULONG_MAX;
   pack->pending_smallest->bytes       = ULONG_MAX;
   pack->pending_votes_smallest->cus   = ULONG_MAX;
   pack->pending_votes_smallest->bytes = ULONG_MAX;
+  pack->pending_late_smallest->cus    = ULONG_MAX;
+  pack->pending_late_smallest->bytes  = ULONG_MAX;
 
   expq_new( _expq, pack_depth );
 
@@ -1220,6 +1244,7 @@ delete_worst( fd_pack_t * pack,
      Pending votes                1.0 until 75% of depth, then 0
      Penalty treap                1.0 at <= 100 transactions, then sqrt(100/N)
      Pending bundles              inf (since the rewards value is fudged)
+     Late                         1.0 unless inserting a vote and votes < 25%
 
      We'll also use M=8. */
 
@@ -1287,6 +1312,12 @@ delete_worst( fd_pack_t * pack,
         treap = q->penalty_treap;
 
         multiplier = sqrtf( 100.0f / (float)fd_ulong_max( 100UL, cnt ) );
+        break;
+      }
+      case FD_ORD_TXN_ROOT_PENDING_LATE: {
+        treap = pack->pending_late;
+        ulong vote_cnt = treap_ele_cnt( pack->pending_votes );
+        if( FD_LIKELY( !is_vote || (vote_cnt>=pack->pack_depth/4UL ) ) ) multiplier = 1.0f;
         break;
       }
     }
@@ -1562,11 +1593,18 @@ fd_pack_insert_txn_fini( fd_pack_t  * pack,
     insert_into = q->penalty_treap;
     ord->root = FD_ORD_TXN_ROOT_PENALTY( penalty_idx[i] );
   } else {
-    ord->root = fd_int_if( is_vote, FD_ORD_TXN_ROOT_PENDING_VOTE, FD_ORD_TXN_ROOT_PENDING );
-
-    fd_pack_smallest_t * smallest = fd_ptr_if( is_vote, &pack->pending_votes_smallest[0], pack->pending_smallest );
-    smallest->cus   = fd_ulong_min( smallest->cus,   ord->compute_est       );
-    smallest->bytes = fd_ulong_min( smallest->bytes, txne->txnp->payload_sz );
+    if( FD_LIKELY( is_vote || txne->txnp->scheduler_arrival_time_nanos<=pack->auction_cutoff_ns ) ) {
+      ord->root = fd_int_if( is_vote, FD_ORD_TXN_ROOT_PENDING_VOTE, FD_ORD_TXN_ROOT_PENDING );
+      fd_pack_smallest_t * smallest = fd_ptr_if( is_vote, &pack->pending_votes_smallest[0], pack->pending_smallest );
+      smallest->cus   = fd_ulong_min( smallest->cus,   ord->compute_est       );
+      smallest->bytes = fd_ulong_min( smallest->bytes, txne->txnp->payload_sz );
+    } else { /* PEBBLE */
+      ord->root = FD_ORD_TXN_ROOT_PENDING_LATE;
+      insert_into = pack->pending_late;
+      fd_pack_smallest_t * smallest = pack->pending_late_smallest;
+      smallest->cus   = fd_ulong_min( smallest->cus,   ord->compute_est       );
+      smallest->bytes = fd_ulong_min( smallest->bytes, txne->txnp->payload_sz );
+    }
   }
 
   pack->pending_txn_cnt++;
@@ -1579,8 +1617,8 @@ fd_pack_insert_txn_fini( fd_pack_t  * pack,
   expq_insert( pack->expiration_q, temp );
 
   if( FD_LIKELY( is_vote ) ) insert_into = pack->pending_votes;
-
   treap_ele_insert( insert_into, ord, pack->pool );
+
   return (is_vote) | (replaces<<1) | (is_durable_nonce<<2);
 }
 #undef REJECT
@@ -1986,6 +2024,10 @@ typedef struct {
   ulong txns_scheduled;
   ulong bytes_scheduled;
   ulong alloc_scheduled;
+  /* PEBBLE: has_more_pending is true if we skipped at least one
+     tx that may become schedulable again in this block (account lock
+     conflicts, write-cost limit before its skip count is exhausted). */
+  int   has_more_pending;
 } sched_return_t;
 
 static inline sched_return_t
@@ -2000,7 +2042,7 @@ fd_pack_schedule_impl( fd_pack_t          * pack,
                        ulong              * use_by_bank_txn,
                        fd_txn_e_t         * out ) {
   if( FD_UNLIKELY( (cu_limit<smallest_in_treap->cus) | (txn_limit==0UL) | (byte_limit<smallest_in_treap->bytes) ) ) {
-    sched_return_t to_return = { .cus_scheduled = 0UL, .txns_scheduled = 0UL, .bytes_scheduled = 0UL };
+    sched_return_t to_return = { 0 };
     return to_return;
   }
 
@@ -2040,6 +2082,8 @@ fd_pack_schedule_impl( fd_pack_t          * pack,
   ulong min_cus   = ULONG_MAX;
   ulong min_bytes = ULONG_MAX;
 
+  int has_more_pending = 0; /* PEBBLE */
+
   treap_rev_iter_t prev = treap_idx_null();
   for( treap_rev_iter_t _cur=treap_rev_iter_init( sched_from, pool ); !treap_rev_iter_done( _cur ); _cur=prev ) {
     /* Capture next so that we can delete while we iterate. */
@@ -2074,6 +2118,7 @@ fd_pack_schedule_impl( fd_pack_t          * pack,
     /* Likely? Unlikely? */
     if( FD_LIKELY( !FD_PACK_BITSET_INTERSECT4_EMPTY( bitset_rw_in_use, bitset_w_in_use, cur->w_bitset, cur->rw_bitset ) ) ) {
       fast_path++;
+      has_more_pending = 1;
       continue;
     }
 
@@ -2136,11 +2181,13 @@ fd_pack_schedule_impl( fd_pack_t          * pack,
       cur->skip = (ushort)(1+fd_ushort_min( (ushort)(compressed_slot_number-1),
                                             (ushort)(fd_ushort_min( cur->skip, FD_PACK_SKIP_CNT )-2) ) );
       write_limit_c++;
+      has_more_pending = 1;
       continue;
     }
 
     if( FD_UNLIKELY( conflicts ) ) {
       slow_path++;
+      has_more_pending = 1;
       continue;
     }
 
@@ -2158,6 +2205,7 @@ fd_pack_schedule_impl( fd_pack_t          * pack,
 
     if( FD_UNLIKELY( conflicts ) ) {
       slow_path++;
+      has_more_pending = 1;
       continue;
     }
 
@@ -2272,8 +2320,25 @@ fd_pack_schedule_impl( fd_pack_t          * pack,
   FD_PACK_BITSET_COPY( pack->bitset_w_in_use,  bitset_w_in_use  );
 
   sched_return_t to_return = { .cus_scheduled=cus_scheduled,     .txns_scheduled=txns_scheduled,
-                               .bytes_scheduled=bytes_scheduled, .alloc_scheduled=alloc_scheduled };
+                               .bytes_scheduled=bytes_scheduled, .alloc_scheduled=alloc_scheduled,
+                               .has_more_pending=has_more_pending };
   return to_return;
+}
+
+/* PEBBLE */
+static inline void
+fd_pack_insert_pending( fd_pack_t * pack, fd_pack_ord_txn_t * ord ) {
+  if( FD_UNLIKELY( ord->txn->scheduler_arrival_time_nanos>pack->auction_cutoff_ns ) ) {
+    ord->root = FD_ORD_TXN_ROOT_PENDING_LATE;
+    treap_ele_insert( pack->pending_late, ord, pack->pool );
+    pack->pending_late_smallest->cus   = fd_ulong_min( pack->pending_late_smallest->cus,   ord->compute_est             );
+    pack->pending_late_smallest->bytes = fd_ulong_min( pack->pending_late_smallest->bytes, ord->txn_e->txnp->payload_sz );
+  } else {
+    ord->root = FD_ORD_TXN_ROOT_PENDING;
+    treap_ele_insert( pack->pending, ord, pack->pool );
+    pack->pending_smallest->cus   = fd_ulong_min( pack->pending_smallest->cus,   ord->compute_est             );
+    pack->pending_smallest->bytes = fd_ulong_min( pack->pending_smallest->bytes, ord->txn_e->txnp->payload_sz );
+  }
 }
 
 int
@@ -2357,14 +2422,19 @@ fd_pack_microblock_complete( fd_pack_t * pack,
     if( FD_UNLIKELY( i+1UL==pack->use_by_bank_txn[ bank_tile ][ txn_cnt ] ) ) {
       txn_cnt++;
       if( FD_LIKELY( best ) ) {
-        /* move best to the main treap */
-        treap_ele_remove( best_penalty->penalty_treap, best, pack->pool );
-        best->root = FD_ORD_TXN_ROOT_PENDING;
-        treap_ele_insert( pack->pending,               best, pack->pool );
-
-        pack->pending_smallest->cus   = fd_ulong_min( pack->pending_smallest->cus,   best->compute_est             );
-        pack->pending_smallest->bytes = fd_ulong_min( pack->pending_smallest->bytes, best->txn_e->txnp->payload_sz );
-
+        /* move best to the main treap.
+           PEBBLE: or park it if arrived late; keep promoting from the
+           same penalty treap until an eligible txn reaches pending.
+           Transactions parked this way return to pending treap when
+           the auction is over instead of their penalty treap, but
+           the impact on performance should be limited. */
+        for(;;) {
+          treap_ele_remove( best_penalty->penalty_treap, best, pack->pool );
+          fd_pack_insert_pending( pack, best );
+          if( FD_LIKELY( best->root!=FD_ORD_TXN_ROOT_PENDING_LATE ) ) break;
+          if( FD_UNLIKELY( !treap_ele_cnt( best_penalty->penalty_treap ) ) ) break;
+          best = treap_rev_iter_ele( treap_rev_iter_init( best_penalty->penalty_treap, pack->pool ), pack->pool );
+        }
         if( FD_UNLIKELY( !treap_ele_cnt( best_penalty->penalty_treap ) ) ) {
           treap_delete( treap_leave( best_penalty->penalty_treap ) );
           /* Removal invalidates any pointers we got from
@@ -2700,7 +2770,10 @@ fd_pack_try_schedule_bundle( fd_pack_t  * pack,
 }
 
 
-ulong
+/* PEBBLE: replace returned number of scheduled txs by a
+   struct containing information used to decide if the ongoing auction
+   should be stopped and when to flush shreds. */
+fd_pack_schedule_next_microblock_res_t
 fd_pack_schedule_next_microblock( fd_pack_t *  pack,
                                   ulong        total_cus,
                                   float        vote_fraction,
@@ -2716,13 +2789,15 @@ fd_pack_schedule_next_microblock( fd_pack_t *  pack,
                                            (ulong)((float)pack->lim->max_txn_per_microblock * vote_fraction) );
 
 
+  fd_pack_schedule_next_microblock_res_t retval = { 0 };
+
   if( FD_UNLIKELY( (pack->microblock_cnt>=pack->lim->max_microblocks_per_block) ) ) {
     FD_MCNT_INC( PACK, MICROBLOCK_PER_BLOCK_LIMIT_REACHED, 1UL );
-    return 0UL;
+    return retval;
   }
   if( FD_UNLIKELY( pack->data_bytes_consumed+MICROBLOCK_DATA_OVERHEAD+FD_TXN_MIN_SERIALIZED_SZ>pack->lim->max_data_bytes_per_block) ) {
     FD_MCNT_INC( PACK, DATA_PER_BLOCK_LIMIT_REACHED, 1UL );
-    return 0UL;
+    return retval;
   }
 
   ulong * use_by_bank_txn = pack->use_by_bank_txn[ bank_tile ];
@@ -2766,8 +2841,11 @@ fd_pack_schedule_next_microblock( fd_pack_t *  pack,
      didn't get any votes. */
   if( FD_UNLIKELY( !!(schedule_flags & FD_PACK_SCHEDULE_BUNDLE) & (status1.txns_scheduled==0UL) ) ) {
     int bundle_result = fd_pack_try_schedule_bundle( pack, bank_tile, out );
-    if( FD_UNLIKELY( bundle_result>0                         ) ) return (ulong)bundle_result;
-    if( FD_UNLIKELY( bundle_result==TRY_BUNDLE_HAS_CONFLICTS ) ) return 0UL;
+    if( FD_UNLIKELY( bundle_result>0 ) ) {
+      retval.schedule_cnt = (ulong)bundle_result;
+      return retval;
+    }
+    if( FD_UNLIKELY( bundle_result==TRY_BUNDLE_HAS_CONFLICTS ) ) return retval;
     /* in the NO_READY_BUNDLES or DOES_NOT_FIT case, we schedule like
        normal. */
     /* We have the early returns here because try_schedule_bundle does
@@ -2777,14 +2855,19 @@ fd_pack_schedule_next_microblock( fd_pack_t *  pack,
 
 
   /* Fill any remaining space with non-vote transactions */
-  if( FD_LIKELY( schedule_flags & FD_PACK_SCHEDULE_TXN ) ) {
+  if( FD_LIKELY( ( schedule_flags & FD_PACK_SCHEDULE_TXN ) && txn_limit>0 ) ) {
     status = fd_pack_schedule_impl( pack, pack->pending,       cu_limit, txn_limit,          byte_limit, alloc_limit, bank_tile,
         pack->pending_smallest,       use_by_bank_txn, out+scheduled );
 
-    scheduled                   += status.txns_scheduled;
     pack->cumulative_block_cost += status.cus_scheduled;
     pack->data_bytes_consumed   += status.bytes_scheduled;
     pack->alloc_consumed        += status.alloc_scheduled;
+    if( FD_LIKELY( status.txns_scheduled ) ) {
+      scheduled                 += status.txns_scheduled;
+      retval.in_auction = 1;
+    } else {
+      retval.auction_stop = !status.has_more_pending;
+    }
   }
 
   ulong nonempty = (ulong)(scheduled>0UL);
@@ -2796,11 +2879,13 @@ fd_pack_schedule_next_microblock( fd_pack_t *  pack,
   fd_histf_sample( pack->vote_per_microblock, status1.txns_scheduled );
 
   pack_memcpy_fini();
-  return scheduled;
+  retval.schedule_cnt = scheduled;
+  return retval;
 }
 
 ulong fd_pack_bank_tile_cnt     ( fd_pack_t const * pack ) { return pack->bank_tile_cnt;         }
 ulong fd_pack_current_block_cost( fd_pack_t const * pack ) { return pack->cumulative_block_cost; }
+ulong fd_pack_current_consumed  ( fd_pack_t const * pack ) { return pack->cumulative_consumed; } /* PEBBLE */
 
 
 void
@@ -2848,6 +2933,7 @@ fd_pack_rebate_cus( fd_pack_t              * pack,
   }
 
   pack->cumulative_block_cost  -= rebate->total_cost_rebate;
+  pack->cumulative_consumed    += rebate->total_consumed; /* PEBBLE */
   pack->cumulative_vote_cost   -= rebate->vote_cost_rebate;
   pack->data_bytes_consumed    -= rebate->data_bytes_rebate;
   pack->alloc_consumed         -= rebate->alloc_rebate;
@@ -2914,6 +3000,7 @@ fd_pack_end_block( fd_pack_t * pack ) {
   pack->microblock_cnt              = 0UL;
   pack->data_bytes_consumed         = 0UL;
   pack->cumulative_block_cost       = 0UL;
+  pack->cumulative_consumed         = 0UL; /* PEBBLE */
   pack->cumulative_vote_cost        = 0UL;
   pack->cumulative_rebated_cus      = 0UL;
   pack->outstanding_microblock_mask = 0UL;
@@ -2962,6 +3049,8 @@ fd_pack_end_block( fd_pack_t * pack ) {
   FD_MHIST_COPY( PACK, CU_REBATED_PER_BLOCK,   pack->rebated_cus_per_block   );
   FD_MHIST_COPY( PACK, CU_NET_PER_BLOCK,       pack->net_cus_per_block       );
   FD_MHIST_COPY( PACK, CU_PCT,                 pack->pct_cus_per_block       );
+
+  fd_pack_auction_end( pack ); /* PEBBLE: move remaining parked txs off the late treap, if any */
 }
 
 static void
@@ -2988,6 +3077,7 @@ fd_pack_clear_all( fd_pack_t * pack ) {
   pack->pending_txn_cnt        = 0UL;
   pack->microblock_cnt         = 0UL;
   pack->cumulative_block_cost  = 0UL;
+  pack->cumulative_consumed    = 0UL; /* PEBBLE */
   pack->cumulative_vote_cost   = 0UL;
   pack->cumulative_rebated_cus = 0UL;
   pack->data_bytes_consumed    = 0UL;
@@ -2997,10 +3087,16 @@ fd_pack_clear_all( fd_pack_t * pack ) {
   pack->pending_smallest->bytes       = ULONG_MAX;
   pack->pending_votes_smallest->cus   = ULONG_MAX;
   pack->pending_votes_smallest->bytes = ULONG_MAX;
+  pack->pending_late_smallest->cus    = ULONG_MAX;
+  pack->pending_late_smallest->bytes  = ULONG_MAX;
+
+  pack->auction_cutoff_ns = LONG_MAX;
+  pack->auction_ongoing   = FD_PACK_AUCTION_NONE;
 
   release_tree( pack->pending,         pack->signature_map, pack->noncemap, pack->pool );
   release_tree( pack->pending_votes,   pack->signature_map, pack->noncemap, pack->pool );
   release_tree( pack->pending_bundles, pack->signature_map, pack->noncemap, pack->pool );
+  release_tree( pack->pending_late,    pack->signature_map, pack->noncemap, pack->pool );
 
   ulong const pool_max = trp_pool_max( pack->pool );
   for( ulong i=0UL; i<pool_max; i++ ) {
@@ -3073,6 +3169,7 @@ delete_transaction( fd_pack_t         * pack,
       root = penalty_treap->penalty_treap;
       break;
     }
+    case FD_ORD_TXN_ROOT_PENDING_LATE: root = pack->pending_late; break;
   }
 
   ulong delete_cnt = 0UL;
@@ -3130,15 +3227,21 @@ delete_transaction( fd_pack_t         * pack,
       }
     }
 
+
     if( FD_LIKELY( best ) ) {
-      /* move best to the main treap */
-      treap_ele_remove( best_penalty->penalty_treap, best, pack->pool );
-      best->root = FD_ORD_TXN_ROOT_PENDING;
-      treap_ele_insert( pack->pending,               best, pack->pool );
-
-      pack->pending_smallest->cus   = fd_ulong_min( pack->pending_smallest->cus,   best->compute_est             );
-      pack->pending_smallest->bytes = fd_ulong_min( pack->pending_smallest->bytes, best->txn_e->txnp->payload_sz );
-
+      /* move best to the main treap.
+         PEBBLE: or park it if arrived late; keep promoting from the
+         same penalty treap until an eligible txn reaches pending.
+         Transactions parked this way return to pending treap when
+         the auction is over instead of their penalty treap, but
+         the impact on performance should be limited. */
+      for(;;) {
+        treap_ele_remove( best_penalty->penalty_treap, best, pack->pool );
+        fd_pack_insert_pending( pack, best );
+        if( FD_LIKELY( best->root!=FD_ORD_TXN_ROOT_PENDING_LATE ) ) break;
+        if( FD_UNLIKELY( !treap_ele_cnt( best_penalty->penalty_treap ) ) ) break;
+        best = treap_rev_iter_ele( treap_rev_iter_init( best_penalty->penalty_treap, pack->pool ), pack->pool );
+      }
       if( FD_UNLIKELY( !treap_ele_cnt( best_penalty->penalty_treap ) ) ) {
         treap_delete( treap_leave( best_penalty->penalty_treap ) );
         penalty_map_remove( pack->penalty_treaps, best_penalty );
@@ -3270,16 +3373,16 @@ fd_pack_verify( fd_pack_t * pack,
 
 
   fd_pack_ord_txn_t  * pool = pack->pool;
-  treap_t * treaps[ 3 ] = { pack->pending, pack->pending_votes, pack->pending_bundles };
+  treap_t * treaps[ 4 ] = { pack->pending, pack->pending_votes, pack->pending_bundles, pack->pending_late };
   ulong txn_cnt = 0UL;
 
-  for( ulong k=0UL; k<3UL+penalty_map_slot_cnt( pack->penalty_treaps ); k++ ) {
+  for( ulong k=0UL; k<4UL+penalty_map_slot_cnt( pack->penalty_treaps ); k++ ) {
     treap_t * treap = NULL;
 
-    if( k<3UL ) treap = treaps[ k ];
-    else if( FD_LIKELY( penalty_map_key_inval( pack->penalty_treaps[ k-3UL ].key ) ) ) continue;
+    if( k<4UL ) treap = treaps[ k ];
+    else if( FD_LIKELY( penalty_map_key_inval( pack->penalty_treaps[ k-4UL ].key ) ) ) continue;
     else {
-      treap = pack->penalty_treaps[ k-3UL ].penalty_treap;
+      treap = pack->penalty_treaps[ k-4UL ].penalty_treap;
       VERIFY_TEST( treap_ele_cnt( treap )>0UL, "empty penalty treap in map" );
     }
 
@@ -3294,10 +3397,10 @@ fd_pack_verify( fd_pack_t * pack,
       fd_pack_ord_txn_t const * in_tbl = sig2txn_ele_query_const( pack->signature_map, &cur->_txn_e, NULL, pool );
       VERIFY_TEST( in_tbl, "signature missing from sig2txn" );
 
-      VERIFY_TEST( (ulong)(cur->root & FD_ORD_TXN_ROOT_TAG_MASK)==fd_ulong_min( k, 3UL )+1UL, "treap element had bad root" );
+      VERIFY_TEST( (ulong)(cur->root & FD_ORD_TXN_ROOT_TAG_MASK)==fd_ulong_min( k, 4UL )+1UL, "treap element had bad root" );
       if( FD_LIKELY( (cur->root & FD_ORD_TXN_ROOT_TAG_MASK)==FD_ORD_TXN_ROOT_PENALTY(0) ) ) {
         fd_acct_addr_t const * penalty_acct = ACCT_IDX_TO_PTR( FD_ORD_TXN_ROOT_PENALTY_ACCT_IDX( cur->root ) );
-        VERIFY_TEST( !memcmp( penalty_acct, pack->penalty_treaps[ k-3UL ].key.b, 32UL ), "transaction in wrong penalty treap" );
+        VERIFY_TEST( !memcmp( penalty_acct, pack->penalty_treaps[ k-4UL ].key.b, 32UL ), "transaction in wrong penalty treap" );
       }
       VERIFY_TEST( cur->expires_at>=pack->expire_before, "treap element expired" );
 
@@ -3458,3 +3561,37 @@ fd_pack_verify( fd_pack_t * pack,
 
 void * fd_pack_leave ( fd_pack_t * pack ) { FD_COMPILER_MFENCE(); return (void *)pack; }
 void * fd_pack_delete( void      * mem  ) { FD_COMPILER_MFENCE(); return mem;          }
+
+void
+fd_pack_auction_start( fd_pack_t * pack,
+                       long        cutoff_ns ) {
+  pack->auction_cutoff_ns = cutoff_ns;
+  pack->auction_ongoing   = FD_PACK_AUCTION_REGULAR;
+}
+
+void
+fd_pack_auction_start_final( fd_pack_t * pack ) {
+  pack->auction_cutoff_ns = LONG_MAX;
+  pack->auction_ongoing   = FD_PACK_AUCTION_FINAL;
+}
+
+void
+fd_pack_auction_end( fd_pack_t * pack ) {
+  pack->auction_cutoff_ns = LONG_MAX;
+  pack->auction_ongoing   = FD_PACK_AUCTION_NONE;
+  if( FD_LIKELY( !treap_ele_cnt( pack->pending_late ) ) ) return;
+  for( treap_fwd_iter_t it=treap_fwd_iter_init( pack->pending_late, pack->pool );
+       !treap_fwd_iter_done( it ); it=treap_fwd_iter_next( it, pack->pool ) ) {
+    treap_fwd_iter_ele( it, pack->pool )->root = FD_ORD_TXN_ROOT_PENDING;
+  }
+  treap_merge( pack->pending, pack->pending_late, pack->pool );
+  pack->pending_smallest->cus   = fd_ulong_min( pack->pending_smallest->cus,   pack->pending_late_smallest->cus   );
+  pack->pending_smallest->bytes = fd_ulong_min( pack->pending_smallest->bytes, pack->pending_late_smallest->bytes );
+  pack->pending_late_smallest->cus   = ULONG_MAX;
+  pack->pending_late_smallest->bytes = ULONG_MAX;
+}
+
+FD_FN_PURE int
+fd_pack_auction_ongoing( fd_pack_t const * pack ) {
+  return pack->auction_ongoing;
+}

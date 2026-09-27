@@ -39,7 +39,11 @@ struct fd_entry_batch_meta {
      entries     0  ordinary microblocks, passed through from pack
      footer     -1
      alpentick   1  the last frag of the slot */
-  int   block_complete;
+  schar block_complete;
+
+  /* PEBBLE: whether to send the shreds after processing this entry
+     batch. */
+  uchar flush;
 
   /* Chained merkle root needed by shred tile.  This is the merkle
      root of the last FEC set of the parent block (that's used as

@@ -317,7 +317,8 @@ before_frag( fd_gui_ctx_t * ctx,
              ulong          sig ) {
   (void)seq;
 
-  if( FD_LIKELY( ctx->in_kind[ in_idx ]==IN_KIND_PACK_POH && sig==FD_PACK_MSG_REDUCE_MB_BOUND ) ) return 1;
+  /* PEBBLE: Ignore "reduce microblock bound" and "flush" signals but not "done draining banks" from pack->poh */
+  if( FD_LIKELY( ctx->in_kind[ in_idx ]==IN_KIND_PACK_POH && sig>=FD_PACK_MSG_FLUSH && sig!=FD_PACK_MSG_DONE_DRAINING ) ) return 1;
 
   if( FD_LIKELY( ctx->in_kind[ in_idx ]==IN_KIND_GOSSIP_OUT &&
                  (sig==FD_GOSSIP_UPDATE_TAG_WFS_DONE || sig==FD_GOSSIP_UPDATE_TAG_PEER_SATURATED) ) ) return 1;
