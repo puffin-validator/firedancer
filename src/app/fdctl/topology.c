@@ -472,6 +472,9 @@ fd_topo_configure_tile( fd_topo_tile_t * tile,
       }
     }
 
+    tile->pack.auctions_per_slot             = config->tiles.pack.auctions_per_slot; /* PEBBLE */
+    tile->pack.ns_per_cu                     = config->tiles.pack.ns_per_cu;
+
     if( FD_UNLIKELY( config->tiles.bundle.enabled ) ) {
 #define PARSE_BUNDLE_PUBKEY( _tile, f ) \
       if( FD_UNLIKELY( !fd_base58_decode_32( config->tiles.bundle.f, tile->_tile.bundle.f ) ) )  \

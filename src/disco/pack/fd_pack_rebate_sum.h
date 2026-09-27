@@ -29,7 +29,12 @@ typedef struct {
 
 struct fd_pack_rebate_sum_private {
   ulong total_cost_rebate;
-  ulong vote_cost_rebate;
+  /* PEBBLE: added total_consumed and changed vote_cost_rebate to keep
+     same struct size. There is no way that total_consumed and
+     vote_cost_rebate is higher than the max cost per block.
+     We are safe as long as it stays below 4000 MCU/block. */
+  uint  total_consumed;
+  uint  vote_cost_rebate;
   ulong data_bytes_rebate;
   ulong microblock_cnt_rebate;
   ulong alloc_rebate;
@@ -45,7 +50,8 @@ typedef struct fd_pack_rebate_sum_private fd_pack_rebate_sum_t;
 
 struct fd_pack_rebate {
   ulong total_cost_rebate;
-  ulong vote_cost_rebate;
+  uint  total_consumed; /* PEBBLE */
+  uint  vote_cost_rebate; /* PEBBLE: changed to uint */
   ulong data_bytes_rebate;
   ulong microblock_cnt_rebate;
   ulong alloc_rebate;

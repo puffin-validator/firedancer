@@ -106,8 +106,26 @@ fd_disco_poh_sig( ulong slot,
   return (slot << 8) | ((execle_tile & 0x3FUL) << 2) | (pkt_type & 0x3UL);
 }
 
+/* Sentinel sig values for messages on the pack_poh.  Normal
+   done_packing messages use fd_disco_execle_sig( slot, pack_idx ). */
+#define FD_PACK_MSG_DONE_DRAINING   (ULONG_MAX)
+#define FD_PACK_MSG_REDUCE_MB_BOUND (ULONG_MAX-1UL)
+/* PEBBLE: FLUSH sig is FD_PACK_MSG_FLUSH | (slot&0xFFFF)<<32 |
+   in_auction_cnt */
+#define FD_PACK_MSG_FLUSH           (0xFFFF000000000000UL)
+
 FD_FN_CONST static inline ulong fd_disco_poh_sig_pkt_type( ulong sig ) { return (sig & 0x3UL); }
 FD_FN_CONST static inline ulong fd_disco_poh_sig_slot( ulong sig ) { return (sig >> 8); }
+FD_FN_CONST static inline ulong fd_disco_poh_sig_flush( ulong slot, uint in_auction_cnt ) { /* PEBBLE */
+  return FD_PACK_MSG_FLUSH | ((slot & 0xFFFFUL)<<32) | (ulong)in_auction_cnt;
+}
+FD_FN_CONST static inline ulong fd_disco_poh_sig_flush_slot16( ulong sig ) {
+  return (sig>>32) & 0xFFFFUL;
+}
+FD_FN_CONST static inline uint  fd_disco_poh_sig_flush_cnt   ( ulong sig ) {
+  return (uint)sig;
+}
+
 FD_FN_CONST static inline ulong fd_disco_poh_sig_execle_tile( ulong sig ) { return (sig >> 2) & 0x3FUL; }
 
 FD_FN_CONST static inline ulong
