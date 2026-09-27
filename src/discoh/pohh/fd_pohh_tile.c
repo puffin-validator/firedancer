@@ -496,6 +496,13 @@ struct fd_pohh_tile {
      of microblocks that might still be received in this slot. */
   ulong microblocks_lower_bound;
 
+  /* PEBBLE: when a FLUSH request is received from pack with a count of
+     in-auction txs, it is saved in in_auction_flush. Poh then sends a
+     FLUSH request to shred when it has received from execle this count
+     of in-auction txs. */
+  uint in_auction_received;
+  uint in_auction_flush;
+
   uchar __attribute__((aligned(32UL))) reset_hash[ 32 ];
   uchar __attribute__((aligned(32UL))) hash[ 32 ];
 
@@ -1210,6 +1217,10 @@ fd_ext_poh_begin_leader( void const * bank,
   ctx->microblocks_lower_bound = 0UL;
   ctx->cus_used                = 0UL;
 
+  /* PEBBLE */
+  ctx->in_auction_flush = 0U;
+  ctx->in_auction_received = 0UL;
+
   ctx->limits.slot_max_cost                     = cus_block_limit;
   ctx->limits.slot_max_vote_cost                = cus_vote_cost_limit;
   ctx->limits.slot_max_write_cost_per_acct      = cus_account_cost_limit;
@@ -1539,6 +1550,7 @@ publish_tick( fd_pohh_tile_t *      ctx,
     meta->reference_tick = hashcnt/ctx->hashcnt_per_tick;
     meta->block_complete = hashcnt==ctx->hashcnt_per_slot;
   }
+  meta->flush = 0; /* PEBBLE */
 
   ulong slot = fd_ulong_if( meta->block_complete, ctx->slot-1UL, ctx->slot );
   meta->parent_offset = 1UL+slot-ctx->reset_slot;
@@ -1952,10 +1964,12 @@ before_frag( fd_pohh_tile_t * ctx,
      pack_poh link.  Frankendancer does not use them. */
   if( FD_UNLIKELY( sig==FD_PACK_MSG_REDUCE_MB_BOUND ) ) return 1; /* discard */
 
-  uint pack_idx = (uint)fd_disco_execle_sig_pack_idx( sig );
-  FD_TEST( ((int)(pack_idx-ctx->expect_pack_idx))>=0L );
-  if( FD_UNLIKELY( pack_idx!=ctx->expect_pack_idx ) ) return -1;
-  ctx->expect_pack_idx++;
+  if( FD_LIKELY( sig < FD_PACK_MSG_FLUSH ) ) { /* PEBBLE: not a FLUSH request */
+    uint pack_idx = (uint)fd_disco_execle_sig_pack_idx( sig );
+    FD_TEST( ((int)(pack_idx-ctx->expect_pack_idx))>=0L );
+    if( FD_UNLIKELY( pack_idx!=ctx->expect_pack_idx ) ) return -1;
+    ctx->expect_pack_idx++;
+  }
 
   return 0;
 }
@@ -1977,6 +1991,11 @@ during_frag( fd_pohh_tile_t * ctx,
 
     uchar const * dcache_entry = fd_chunk_to_laddr_const( ctx->in[ in_idx ].mem, chunk );
     fd_multi_epoch_leaders_stake_msg_init( ctx->mleaders, fd_type_pun_const( dcache_entry ) );
+    return;
+  }
+
+  /* PEBBLE */
+  if( FD_UNLIKELY( sig>=FD_PACK_MSG_FLUSH ) ) {
     return;
   }
 
@@ -2038,18 +2057,21 @@ during_frag( fd_pohh_tile_t * ctx,
   }
 }
 
+/* PEBBLE: add flush argument */
 static void
 publish_microblock( fd_pohh_tile_t *    ctx,
                     fd_stem_context_t * stem,
                     ulong               slot,
                     ulong               hashcnt_delta,
-                    ulong               txn_cnt ) {
+                    ulong               txn_cnt,
+                    uchar               flush ) {
   uchar * dst = (uchar *)fd_chunk_to_laddr( ctx->shred_out->mem, ctx->shred_out->chunk );
   FD_TEST( slot>=ctx->reset_slot );
   fd_entry_batch_meta_t * meta = (fd_entry_batch_meta_t *)dst;
   meta->parent_offset = 1UL+slot-ctx->reset_slot;
   meta->reference_tick = (ctx->hashcnt/ctx->hashcnt_per_tick) % ctx->ticks_per_slot;
   meta->block_complete = !ctx->hashcnt;
+  meta->flush = flush;
 
   /* Refer to publish_tick() for details on meta->parent_block_id_valid. */
   meta->parent_block_id_valid = ctx->parent_slot == (slot-meta->parent_offset);
@@ -2094,6 +2116,33 @@ publish_microblock( fd_pohh_tile_t *    ctx,
     ctx->store_leader_bank = NULL;
     ctx->store_leader_bank_slot = ULONG_MAX;
   }
+}
+
+/* PEBBLE: same as `publish_microblock`, but publish only a
+   batch_meta with a flush request, without microblock. */
+static void
+fd_poh_publish_flush( fd_pohh_tile_t    * ctx,
+                      fd_stem_context_t * stem ) {
+  ulong tspub = (ulong)fd_frag_meta_ts_comp( fd_tickcount() );
+  ulong sz = sizeof(fd_entry_batch_meta_t);
+  ulong sig = fd_disco_poh_sig( ctx->slot, POH_PKT_TYPE_MICROBLOCK, 0UL );
+
+  uchar * dst = (uchar *)fd_chunk_to_laddr( ctx->shred_out->mem, ctx->shred_out->chunk );
+  fd_entry_batch_meta_t * meta = (fd_entry_batch_meta_t *)dst;
+  meta->parent_offset = 1UL+ctx->slot-ctx->reset_slot;
+  meta->reference_tick = (ctx->hashcnt/ctx->hashcnt_per_tick) % ctx->ticks_per_slot;
+  meta->block_complete = 0;
+  meta->flush = 1;
+
+  /* Refer to publish_tick() for details on meta->parent_block_id_valid. */
+  meta->parent_block_id_valid = ctx->parent_slot == (ctx->slot-meta->parent_offset);
+  if( FD_LIKELY( meta->parent_block_id_valid ) ) {
+    fd_memcpy( meta->parent_block_id, ctx->parent_block_id, 32UL );
+  }
+
+  fd_stem_publish( stem, ctx->shred_out->idx, sig, ctx->shred_out->chunk, sz, 0UL, 0UL, tspub );
+  ctx->shred_seq = stem->seqs[ ctx->shred_out->idx ];
+  ctx->shred_out->chunk = fd_dcache_compact_next( ctx->shred_out->chunk, sz, ctx->shred_out->chunk0, ctx->shred_out->wmark );
 }
 
 static inline void
@@ -2149,6 +2198,22 @@ after_frag( fd_pohh_tile_t *    ctx,
     return;
   }
 
+  /* PEBBLE: when a FLUSH request is received from pack with a count of
+     in-auction microblocks, either publish a bare
+     flush request to shred if we already received from execle this
+     count of in-auction microblocks (unlikely), or store this count and
+     request later a flush when we receive this count of microblocks. */
+  if( FD_UNLIKELY( sig>=FD_PACK_MSG_FLUSH ) ) {
+    ulong slot16 = fd_disco_poh_sig_flush_slot16( sig );
+    if( FD_UNLIKELY( !ctx->current_leader_bank || ( ctx->slot & 0xFFFFUL )!=slot16 ) ) return;
+    uint in_auction_cnt = fd_disco_poh_sig_flush_cnt( sig );
+    if( FD_UNLIKELY( in_auction_cnt==ctx->in_auction_received ) )
+      fd_poh_publish_flush(ctx, stem);
+    else if( FD_LIKELY( in_auction_cnt>ctx->in_auction_received ) )
+      ctx->in_auction_flush = in_auction_cnt; /* Flush when the count is reached */
+    return;
+  }
+
   if( FD_UNLIKELY( !ctx->microblocks_lower_bound ) ) {
     double tick_per_ns = fd_tempo_tick_per_ns( NULL );
     fd_histf_sample( ctx->first_microblock_delay, (ulong)((double)(fd_log_wallclock()-ctx->reset_slot_start_ns)/tick_per_ns) );
@@ -2164,6 +2229,17 @@ after_frag( fd_pohh_tile_t *    ctx,
   FD_TEST( ctx->current_leader_bank );
   FD_TEST( ctx->microblocks_lower_bound<ctx->max_microblocks_per_slot );
   ctx->microblocks_lower_bound += 1UL;
+
+  /* PEBBLE: if the microblock contains an in-auction tx, check if it's
+     the last of the auction. If yes we request a flush from the shred
+     tile. */
+  uchar flush = 0;
+  if( FD_LIKELY( ctx->_microblock_trailer->in_auction) ) {
+    ctx->in_auction_received++;
+    if( FD_UNLIKELY( ctx->in_auction_received == ctx->in_auction_flush ) ) {
+      flush = 1;
+    }
+  }
 
   ulong txn_cnt = (sz-sizeof(fd_microblock_trailer_t))/sizeof(fd_txn_p_t);
   fd_txn_p_t * txns = (fd_txn_p_t *)(ctx->_txns);
@@ -2184,7 +2260,15 @@ after_frag( fd_pohh_tile_t *    ctx,
      transactions failed to execute, the microblock would be empty,
      causing agave to think it's a tick and complain.  Instead, we just
      skip the microblock and don't hash or update the hashcnt. */
-  if( FD_UNLIKELY( !executed_txn_cnt ) ) return;
+  if( FD_UNLIKELY( !executed_txn_cnt ) ) {
+    /* PEBBLE: if the failed txs was the last of an auction, and since
+       we won't publish a microblock, publish a bare flush request
+       instead. */
+    if( FD_UNLIKELY( flush ) ) {
+      fd_poh_publish_flush( ctx, stem );
+    }
+    return;
+  }
 
   uchar data[ 64 ];
   fd_memcpy( data, ctx->hash, 32UL );
@@ -2215,7 +2299,7 @@ after_frag( fd_pohh_tile_t *    ctx,
     fd_ext_poh_register_tick( ctx->current_leader_bank, ctx->hash );
   }
 
-  publish_microblock( ctx, stem, target_slot, hashcnt_delta, txn_cnt );
+  publish_microblock( ctx, stem, target_slot, hashcnt_delta, txn_cnt, flush );
 
   if( FD_UNLIKELY( !(ctx->hashcnt%ctx->hashcnt_per_tick ) ) ) {
     if( FD_UNLIKELY( ctx->slot>ctx->next_leader_slot ) ) {

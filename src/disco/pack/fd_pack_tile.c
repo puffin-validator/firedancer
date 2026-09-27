@@ -15,6 +15,7 @@
 #include "../pack/fd_pack_cost.h"
 #include "../pack/fd_pack_pacing.h"
 #include "../fd_clock_tile.h"
+#include "../../flamenco/leaders/fd_leaders.h"
 
 #include <string.h>
 
@@ -58,6 +59,9 @@ const ulong CUS_PER_MICROBLOCK = 1600000UL;
 const float VOTE_FRACTION = 1.0f; /* schedule all available votes first */
 #define EFFECTIVE_TXN_PER_MICROBLOCK 1UL
 
+/* PEBBLE: auction_stop relies on votes and non-votes never sharing a
+   microblock; otherwise cu_limit_c must set has_more_pending. */
+FD_STATIC_ASSERT( EFFECTIVE_TXN_PER_MICROBLOCK==1UL, pebble_auction_stop );
 
 
 #if FD_PACK_USE_EXTRA_STORAGE
@@ -87,8 +91,9 @@ const float VOTE_FRACTION = 1.0f; /* schedule all available votes first */
 /* Sync with src/app/shared/fd_config.c */
 #define FD_PACK_STRATEGY_PERF     0
 #define FD_PACK_STRATEGY_BALANCED 1
+#define FD_PACK_STRATEGY_PEBBLE   2
 
-static char const * const schedule_strategy_strings[2] = { "PRF", "BAL" };
+static char const * const schedule_strategy_strings[3] = { "PRF", "BAL", "PBL" };
 
 
 typedef struct {
@@ -143,6 +148,11 @@ typedef struct {
      this so that when we are done we can tell the PoH tile how many
      microblocks to expect in the slot. */
   ulong slot_microblock_cnt;
+
+  /* PEBBLE: count the microblocks we have packed for the
+     leader slot that contain at least one transaction
+     only packable during an auction (not a vote nor a bundle). */
+  uint in_auction_cnt;
 
   /* Counter which increments when we've finished packing for a slot */
   uint pack_idx;
@@ -298,6 +308,31 @@ typedef struct {
     ulong                 metrics[4];
   } crank[1];
 
+
+  /* PEBBLE */
+  /* Number of auctions per slot, or 0 if syncing with Jito BE. */
+  ulong auctions_per_slot;
+  /* Interval between 2 auction starts or 0 if syncing with Jito BE. */
+  ulong auction_period_ns;
+  /* Target total consumed CU at the end of the ongoing auction. */
+  ulong auction_end_cu;
+  /* Start of next auction in ns. Meaningful only if auction_period_ns != 0. */
+  long next_auction_ns;
+  /* Fixed delay we wait for after reception of last bundle before starting an auction.
+     Meaningful only if auction_period_ns == 0.*/
+  long last_bundle_auction_ticks;
+  /* Amount of CU we plan to consume each auction. Meaningful only if auction_period_ns != 0. */
+  ulong cu_per_auction;
+  /* Last instant we packed a bundle. Meaningful only if auction_period_ns == 0. */
+  long last_bundle_received_ticks;
+  /* Start of previous auction in ticks. Meaningful only if auction_period_ns == 0. */
+  long last_auction_start_ticks;
+  /* Index of current auction. */
+  long auction_idx;
+  /* Index of last auction in this slot, or LONG_MAX if auction_period_ns == 0. */
+  long auction_idx_last;
+
+  float ns_per_cu;
 
   /* Used between during_frag and after_frag */
   ulong pending_rebate_sz;
@@ -519,6 +554,26 @@ during_housekeeping( fd_pack_ctx_t * ctx ) {
   }
 }
 
+/* PEBBLE */
+static void
+end_auction( fd_pack_ctx_t     * ctx,
+             fd_stem_context_t * stem ) {
+
+  fd_pack_auction_end( ctx->pack );
+
+  /* Message poh that the shreds must be flushed after receiving
+     this count of in-auction microblocks.
+
+     Flushing shreds at the end of auctions have 2 main benefits:
+     * When using Jito and Jito synchronization, to ensure that the
+       traders and the BE have the complete state and to give the
+       bundles better chance to succeed.
+     * In all cases, to reduce the average transaction retention delay,
+       to provide faster confirmation, and possibly to attract more
+       reactive transactions (e.g. arbitrages, liquidations). */
+  fd_stem_publish( stem, ctx->poh_out.out_idx, fd_disco_poh_sig_flush( ctx->leader_slot, ctx->in_auction_cnt ), 0UL, 0UL, 0UL, 0UL, fd_frag_meta_ts_comp( fd_tickcount() ) );
+}
+
 static inline void
 before_credit( fd_pack_ctx_t *     ctx,
                fd_stem_context_t * stem,
@@ -674,6 +729,8 @@ after_credit( fd_pack_ctx_t *     ctx,
     ctx->drain_execle        = 1;
     ctx->leader_slot         = ULONG_MAX;
     ctx->slot_microblock_cnt = 0UL;
+    ctx->in_auction_cnt      = 0U; /* PEBBLE */
+
     remove_ib( ctx );
 
     update_metric_state( ctx, now, FD_PACK_METRIC_STATE_LEADER,       0 );
@@ -828,12 +885,151 @@ after_credit( fd_pack_ctx_t *     ctx,
         flags = FD_PACK_SCHEDULE_VOTE | fd_int_if( i==0,                FD_PACK_SCHEDULE_BUNDLE, 0 )
                                       | fd_int_if( i<pacing_execle_cnt, FD_PACK_SCHEDULE_TXN,    0 );
         break;
+      case FD_PACK_STRATEGY_PEBBLE:
+        /* Schedule ASAP votes and bundles.
+           Auctions for other txs, lasting until:
+           * there are no more pending txs (among those that arrived before auction start),
+           * we consumed enough CU. */
+        flags = FD_PACK_SCHEDULE_VOTE | FD_PACK_SCHEDULE_BUNDLE;
+        /* If in Jito mode, we enter the final auction if filling out
+           the block would require all execle tiles to be sure we don't
+           leave out txs that could fit in the block. */
+        if( FD_UNLIKELY( pacing_execle_cnt>=(int)execle_cnt &&
+                         fd_pack_auction_ongoing( ctx->pack )!=FD_PACK_AUCTION_FINAL &&
+                         ctx->auction_period_ns==0 ) ) {
+          if( FD_UNLIKELY( fd_pack_auction_ongoing( ctx->pack )==FD_PACK_AUCTION_REGULAR ) ) {
+            /* First end ongoing auction, if any, to move off all txs
+               parked in late treap. */
+            fd_pack_auction_end( ctx->pack );
+          }
+          fd_pack_auction_start_final( ctx->pack );
+          FD_LOG_INFO(( "final auction %ld start", ctx->auction_idx ));
+        } else if( FD_UNLIKELY( fd_pack_auction_ongoing( ctx->pack )==FD_PACK_AUCTION_NONE ) ) {
+          /* No auction ongoing, check if we must start one.
+             This is the most likely, but we want to favourize
+             the busy case. */
+          if( FD_UNLIKELY( ctx->auction_period_ns==0 ) ) {
+            /* Syncing with Jito.
+               If we connect to a Jito Block Engine (BE) via the bundle
+               tile, then our interest is that the received bundles
+               succeed; otherwise we won't collect the tip.
+
+               When an automated system reacts to a state change by
+               sending a Jito bundle, the following 5 steps occur:
+               1. the validator sends the state change as shreds,
+               2. the sender receive the shreds, constructs its bundle,
+                  send it to the Jito BE,
+               3. the BE receives the bundle, simulates it against the
+                  state the BE currently has, and, if simulation
+                  succeeds, includes the bundle in its next 50 ms
+                  auction,
+               4. BE auction occurs, and if the bundle wins, it is sent
+                  to the validator
+               5. the validator receives the bundle and executes it.
+
+               To ensure that the bundle is executed successfully by the
+               validator, the state at this moment must match both the
+               state the sender has at step 2, and the state the BE has
+               at step 3 and 4.
+               This means the validator should not execute any TPU
+               transaction between the sending of the shreds and the
+               reception of bundles after next BE auction.
+
+               To achieve that, we start our own auction right after the
+               reception of a batch of bundles.
+               This way, the delay without state change is maximized,
+               leaving hopefully enough time for all 5 steps above to
+               occur.
+
+               However, the gRPC protocol used by Jito to send bundles
+               does not include any signal that a bundle is the last of
+               the auction batch, so Pebble must use a heuristic: the
+               bundle batch is considered over when no bundle has been
+               received for 5 ms since the last one.
+               This means that an unavoidable 5 ms delay exists between
+               the reception of the last bundle and the start of the
+               auction. Also, if the block engine sends many bundles,
+               there may be no pause between batches from two different
+               BE auctions and the validator won't start any auction in
+               between.
+               In all cases (whether Jito synchronization is enabled or
+               not), a final auction is always conducted at the end of
+               each slot using all available banks to ensure maximum
+               transaction packing (like deprecated revenue strategy),
+               even in the edge cases where no standard auctions have
+               started.
+               Since Jito conducts auctions every 50ms, we also require
+               that last auction started at least 8*5 = 40ms before. */
+            if( FD_UNLIKELY( now - ctx->last_bundle_auction_ticks > ctx->last_bundle_received_ticks ) ) {
+              ctx->last_bundle_received_ticks = LONG_MAX; /* No more auction start until a new bundle is received */
+              if( FD_LIKELY( now > ctx->last_auction_start_ticks + (ctx->last_bundle_auction_ticks << 3 ) ) ) {
+                ctx->last_auction_start_ticks = now;
+                ctx->auction_idx++;
+                long now_ns = fd_clock_tile_tickcount_to_wallclock( ctx->clock, now );
+                /* The amount of CU we want to consume at the end of the auction depends linearly
+                   on the time elapsed since the start of the slot. */
+                ctx->auction_end_cu = (ulong) (now_ns - ctx->_became_leader->slot_start_ns) * ctx->limits.slot_max_cost / (ulong) (ctx->slot_end_ns - ctx->_became_leader->slot_start_ns);
+                if( FD_UNLIKELY( fd_pack_current_consumed(ctx->pack) >= ctx->auction_end_cu )) {
+                  /* Target already reached (by votes or bundles). Cancel the auction. */
+                  FD_LOG_INFO(( "auction %ld cancelled: target %lu cu already reached", ctx->auction_idx, ctx->auction_end_cu ));
+                } else {
+                  fd_pack_auction_start( ctx->pack, now_ns );
+                  FD_LOG_INFO(( "auction %ld start: target %lu cu", ctx->auction_idx, ctx->auction_end_cu ));
+                }
+              }
+            }
+          } else {
+            /* Not syncing with Jito: auctions are held every
+               auction_period. */
+            long now_ns = fd_clock_tile_tickcount_to_wallclock( ctx->clock, now );
+            if( FD_UNLIKELY( now_ns > ctx->next_auction_ns) ) {
+              ctx->auction_end_cu += ctx->cu_per_auction;
+              ctx->next_auction_ns += (long) ctx->auction_period_ns;
+              ctx->auction_idx++;
+              if( FD_UNLIKELY( fd_pack_current_consumed(ctx->pack) >= ctx->auction_end_cu )) {
+                /* Target already reached (by votes or bundles). Cancel the auction. */
+                FD_LOG_INFO(( "auction %ld cancelled: target %lu cu already reached", ctx->auction_idx, ctx->auction_end_cu ));
+              } else {
+                if( FD_LIKELY( ctx->auction_idx<ctx->auction_idx_last || ctx->leader_slot%FD_EPOCH_SLOTS_PER_ROTATION!=FD_EPOCH_SLOTS_PER_ROTATION-1 ) ) {
+                  fd_pack_auction_start( ctx->pack, now_ns );
+                  FD_LOG_INFO(( "auction %ld start: target %lu cu", ctx->auction_idx, ctx->auction_end_cu ));
+                } else {
+                  fd_pack_auction_start_final( ctx->pack );
+                  FD_LOG_INFO(( "final auction %ld start", ctx->auction_idx ));
+                }
+              }
+            }
+          }
+        }
+        if( FD_UNLIKELY( fd_pack_auction_ongoing( ctx->pack )!=FD_PACK_AUCTION_NONE ) ) {
+          /* We must not use too many execle/lines/tracks to execute the
+             transactions.
+             If we use 5, in the worst case, we will be able to pack at
+             most 60/5 = 12M CU of txs locking the same account, which
+             is lower that the maximum allowed of 24M.
+             We could therefore lose revenue in cases where some
+             accounts are highly active during the slot.
+             We must also ensure to finish playing the CU before next
+             auction.
+             Since we can play 1 CU per line every 9ns with Frankendancer,
+             and every 5ns with Firedancer (default values for
+             `config.tiles.pack.ns_per_cu`), 2 lines is enough to pack
+             60M CU without contention in both cases.
+             Constellation uses 4 virtual tracks.
+             We choose 3 for the maximum of execle tiles to execute
+             in-auction transactions.
+             But if filling out the block within the remaining time
+             would require more, we use more. */
+          flags |= fd_int_if( i < fd_int_max(3, pacing_execle_cnt), FD_PACK_SCHEDULE_TXN, 0);
+        }
+        break;
     }
 
     fd_pack_out_ctx_t * execle_out = &ctx->execle_out[ i ];
     fd_txn_e_t * microblock_dst = fd_chunk_to_laddr( execle_out->mem, execle_out->chunk );
     long schedule_duration = -fd_tickcount();
-    ulong schedule_cnt = fd_pack_schedule_next_microblock( ctx->pack, CUS_PER_MICROBLOCK, VOTE_FRACTION, (ulong)i, flags, microblock_dst );
+    fd_pack_schedule_next_microblock_res_t schedule_res = fd_pack_schedule_next_microblock( ctx->pack, CUS_PER_MICROBLOCK, VOTE_FRACTION, (ulong)i, flags, microblock_dst );
+    ulong schedule_cnt = schedule_res.schedule_cnt;
     schedule_duration      += fd_tickcount();
     fd_histf_sample( (schedule_cnt>0UL) ? ctx->schedule_duration : ctx->no_sched_duration, (ulong)schedule_duration );
 
@@ -849,6 +1045,7 @@ after_credit( fd_pack_ctx_t *     ctx,
       trailer->bank_idx = ctx->leader_bank_idx;
       trailer->bank_seq = ctx->leader_bank_seq;
       trailer->microblock_idx = ctx->slot_microblock_cnt;
+      trailer->in_auction = schedule_res.in_auction; /* PEBBLE */
       trailer->pack_idx = ctx->pack_idx;
       trailer->pack_txn_idx = ctx->pack_txn_cnt;
       trailer->is_bundle = !!(microblock_dst->txnp->flags & FD_TXN_P_FLAGS_BUNDLE);
@@ -865,6 +1062,7 @@ after_credit( fd_pack_ctx_t *     ctx,
       ctx->pack_idx += fd_uint_if( trailer->is_bundle, (uint)schedule_cnt, 1U );
       ctx->pack_txn_cnt += schedule_cnt;
       ctx->slot_bundle_txn_cnt += fd_ulong_if( trailer->is_bundle, schedule_cnt, 0UL );
+      ctx->in_auction_cnt += (uint) schedule_res.in_auction; /* PEBBLE */
 
       ctx->execle_idle_bitset = fd_ulong_pop_lsb( ctx->execle_idle_bitset );
       ctx->skip_cnt           = (long)schedule_cnt * fd_long_if( ctx->use_consumed_cus, (long)execle_cnt/2L, 1L );
@@ -878,6 +1076,14 @@ after_credit( fd_pack_ctx_t *     ctx,
          attempts for (execle_cnt + 1) link polls after a successful
          schedule attempt. */
       fd_long_store_if( ctx->use_consumed_cus, &(ctx->skip_cnt), (long)(ctx->execle_cnt + 1) );
+    }
+    /* PEBBLE: if we are conducting an auction, check if we must end it
+       because no more txs are available.
+       The final auction (state 2) is never ended before the slot
+       ends. */
+    if( FD_UNLIKELY( schedule_res.auction_stop && fd_pack_auction_ongoing( ctx->pack )==FD_PACK_AUCTION_REGULAR ) ) {
+      FD_LOG_INFO(( "auction %ld end: consumed %lu cu, no more txs", ctx->auction_idx, fd_pack_current_consumed(ctx->pack) ));
+      end_auction( ctx, stem );
     }
   }
 
@@ -923,6 +1129,7 @@ after_credit( fd_pack_ctx_t *     ctx,
     ctx->drain_execle        = 1;
     ctx->leader_slot         = ULONG_MAX;
     ctx->slot_microblock_cnt = 0UL;
+    ctx->in_auction_cnt      = 0U; /* PEBBLE */
     remove_ib( ctx );
 
     return;
@@ -1157,7 +1364,7 @@ after_frag( fd_pack_ctx_t *     ctx,
   case IN_KIND_REPLAY:
   case IN_KIND_POH: {
     long now_ticks = fd_tickcount();
-    long now_ns    = fd_log_wallclock();
+    long now_ns    = fd_clock_tile_tickcount_to_wallclock( ctx->clock, now_ticks );
 
     if( FD_UNLIKELY( ctx->leader_slot!=ULONG_MAX ) ) {
       fd_done_packing_t * done_packing = fd_chunk_to_laddr( ctx->poh_out.mem, ctx->poh_out.chunk );
@@ -1174,6 +1381,7 @@ after_frag( fd_pack_ctx_t *     ctx,
       ctx->drain_execle        = 1;
       ctx->leader_slot         = ULONG_MAX;
       ctx->slot_microblock_cnt = 0UL;
+      ctx->in_auction_cnt      = 0U; /* PEBBLE */
       remove_ib( ctx );
     }
     ctx->leader_slot = leader_slot;
@@ -1211,7 +1419,22 @@ after_frag( fd_pack_ctx_t *     ctx,
     long end_ticks = now_ticks + (long)((double)fd_long_max( ctx->_became_leader->slot_end_ns - now_ns, 1L )*tick_per_ns);
     /* We may still get overrun, but then we'll never use this and just
        reinitialize it the next time when we actually become leader. */
-    fd_pack_pacing_init( ctx->pacer, now_ticks, end_ticks, (float)tick_per_ns, ctx->limits.slot_max_cost );
+    fd_pack_pacing_init( ctx->pacer, now_ticks, end_ticks, (float)tick_per_ns, ctx->ns_per_cu, ctx->limits.slot_max_cost );
+
+    /* PEBBLE */
+    if( FD_LIKELY( ctx->strategy == FD_PACK_STRATEGY_PEBBLE)) {
+      if( FD_UNLIKELY( ctx->auctions_per_slot ) ) {
+        ctx->next_auction_ns = now_ns;
+        ctx->auction_period_ns = (ulong) (ctx->_became_leader->slot_end_ns - ctx->_became_leader->slot_start_ns)/ctx->auctions_per_slot;
+        ctx->cu_per_auction = (ctx->limits.slot_max_cost + ctx->auctions_per_slot - 1) / ctx->auctions_per_slot;
+        ctx->auction_idx_last = (long)ctx->auctions_per_slot - 1;
+        ctx->auction_end_cu = 0UL;
+      } else {
+        ctx->last_auction_start_ticks = 0L;
+        ctx->last_bundle_received_ticks = LONG_MAX; /* Don't start auctions before receiving first bundle. */
+      }
+      ctx->auction_idx = -1;
+    }
 
     if( FD_UNLIKELY( ctx->crank->enabled ) ) {
       /* If we get overrun, we'll just never use these values, but the
@@ -1251,6 +1474,16 @@ after_frag( fd_pack_ctx_t *     ctx,
     fd_pack_rebate_cus( ctx->pack, ctx->rebate->rebate );
     ctx->pending_rebate_sz = 0UL;
     fd_pack_pacing_update_consumed_cus( ctx->pacer, fd_pack_current_block_cost( ctx->pack ), now );
+
+    /* PEBBLE: if we are conducting an auction, check if we must end it
+       because we consumed enough cu. */
+    if( FD_LIKELY( fd_pack_auction_ongoing( ctx->pack )==FD_PACK_AUCTION_REGULAR) ) {
+      if( FD_UNLIKELY( fd_pack_current_consumed( ctx->pack )>=ctx->auction_end_cu ) ) {
+        FD_LOG_INFO(( "auction %ld end: consumed %lu cu, target reached", ctx->auction_idx, fd_pack_current_consumed(ctx->pack) ));
+        end_auction( ctx, stem );
+      }
+    }
+
     break;
   }
   case IN_KIND_RESOLV: {
@@ -1266,7 +1499,9 @@ after_frag( fd_pack_ctx_t *     ctx,
         ulong deleted;
         long insert_duration = -fd_tickcount();
         int result = fd_pack_insert_bundle_fini( ctx->pack, ctx->current_bundle->bundle, ctx->current_bundle->txn_cnt, ctx->current_bundle->min_blockhash_slot, 0, ctx->blk_engine_cfg, &deleted );
-        insert_duration      += fd_tickcount();
+        const long t = fd_tickcount();
+        insert_duration      += t;
+        ctx->last_bundle_received_ticks = t; /* PEBBLE */
         FD_MCNT_INC( PACK, TXN_DELETED, deleted );
         ctx->insert_result[ result + FD_PACK_INSERT_RETVAL_OFF ] += ctx->current_bundle->txn_received;
         fd_histf_sample( ctx->insert_duration, (ulong)insert_duration );
@@ -1395,7 +1630,7 @@ unprivileged_init( fd_topo_t const *      topo,
 
   if( FD_UNLIKELY( tile->pack.execle_tile_count>FD_PACK_MAX_EXECLE_TILES ) ) FD_LOG_ERR(( "pack tile connects to too many execle tiles" ));
 
-  FD_TEST( (tile->pack.schedule_strategy>=0) & (tile->pack.schedule_strategy<=FD_PACK_STRATEGY_BALANCED) );
+  FD_TEST( (tile->pack.schedule_strategy>=0) & (tile->pack.schedule_strategy<=FD_PACK_STRATEGY_PEBBLE) );
 
   ctx->crank->enabled = tile->pack.bundle.enabled;
   if( FD_UNLIKELY( tile->pack.bundle.enabled ) ) {
@@ -1483,6 +1718,17 @@ unprivileged_init( fd_topo_t const *      topo,
   ctx->use_consumed_cus              = tile->pack.use_consumed_cus;
   ctx->bench_max_shreds_per_block    = tile->pack.bench_max_shreds_per_block;
   ctx->crank->enabled                = tile->pack.bundle.enabled;
+
+  /* PEBBLE */
+  ctx->auctions_per_slot             = tile->pack.auctions_per_slot;
+  ctx->auction_period_ns             = 0UL; /* Set when becoming leader */
+  ctx->in_auction_cnt                = 0U;
+  ctx->next_auction_ns               = 0L;
+  ctx->last_bundle_auction_ticks     = (long)(tick_per_ns * 5000000.0); /* 5ms */
+  ctx->last_bundle_received_ticks    = LONG_MAX; /* Don't start auctions before receiving first bundle */
+  ctx->auction_idx_last              = LONG_MAX;
+
+  ctx->ns_per_cu = tile->pack.ns_per_cu;
 
   ctx->limits.slot_max_cost                = limits_lower->max_cost_per_block;
   ctx->limits.slot_max_vote_cost           = limits_lower->max_vote_cost_per_block;
@@ -1594,16 +1840,29 @@ populate_allowed_fds( fd_topo_t const *      topo,
      B. DONE_DRAINING. *after* DONE_PACKING. return.
      C. REDUCE_MB_BOUND. return.
      D. SCHEDULE_MB. *doesn't* return.
-     E. EXHAUST_MICROBLOCKS. Sets ctx->leader_slot=ULONG_MAX. return.
+     E. END AUCTION (in after_credits).
+        Requires auction_ongoing==FD_PACK_AUCTION_REGULAR.
+        Sets it to FD_PACK_AUCTION_NONE.
+     F. EXHAUST_MICROBLOCKS. Sets ctx->leader_slot=ULONG_MAX. return.
    after_frag:
-   	 F. ABANDONED. Requires ctx->leader_slot!=ULONG_MAX
+     G. END AUCTION (on rebate). Requires ctx->leader_slot!=ULONG_MAX
+        and auction_ongoing==FD_PACK_AUCTION_REGULAR.
+   	 H. ABANDONED. Requires ctx->leader_slot!=ULONG_MAX
 
-     It isn't possible to get a burst of 3, but a burst of 2 is possible
-     in these situations.
+     A burst of 2 is possible in these situations :
 
-     C -> F
-     D -> F
      D -> E
+     C -> H
+     D -> H
+     D -> F
+     D -> G
+
+     And a burst of 3 is possible in these situations :
+     D -> E -> F
+     D -> E -> H
+
+     D publishes on pack_execle, while E, F, H publishes on pack_poh.
+     So we can keep a burst of 2.
  */
 #define STEM_BURST (2UL)
 

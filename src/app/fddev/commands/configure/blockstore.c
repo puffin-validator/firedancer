@@ -78,7 +78,8 @@ init( config_t const * config ) {
   fd_entry_batch_meta_t meta[ 1 ] = {{
     .parent_offset  = 0UL,
     .reference_tick = ticks_per_slot,
-    .block_complete = 1
+    .block_complete = 1,
+    .flush = 0 /* PEBBLE */
   }};
 
   fd_shredder_t _shredder[ 1 ];
