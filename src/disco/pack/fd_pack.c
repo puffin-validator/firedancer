@@ -2395,10 +2395,19 @@ fd_pack_microblock_complete( fd_pack_t * pack,
     if( FD_UNLIKELY( i+1UL==pack->use_by_bank_txn[ bank_tile ][ txn_cnt ] ) ) {
       txn_cnt++;
       if( FD_LIKELY( best ) ) {
-        /* move best to the main treap */
-        treap_ele_remove( best_penalty->penalty_treap, best, pack->pool );
-        fd_pack_insert_pending( pack, best );
-
+        /* move best to the main treap.
+           PEBBLE: or park it if arrived late; keep promoting from the
+           same penalty treap until an eligible txn reaches pending.
+           Transactions parked this way return to pending treap when
+           the auction is over instead of their penalty treap, but
+           the impact on performance should be limited. */
+        for(;;) {
+          treap_ele_remove( best_penalty->penalty_treap, best, pack->pool );
+          fd_pack_insert_pending( pack, best );
+          if( FD_LIKELY( best->root!=FD_ORD_TXN_ROOT_PENDING_LATE ) ) break;
+          if( FD_UNLIKELY( !treap_ele_cnt( best_penalty->penalty_treap ) ) ) break;
+          best = treap_rev_iter_ele( treap_rev_iter_init( best_penalty->penalty_treap, pack->pool ), pack->pool );
+        }
         if( FD_UNLIKELY( !treap_ele_cnt( best_penalty->penalty_treap ) ) ) {
           treap_delete( treap_leave( best_penalty->penalty_treap ) );
           /* Removal invalidates any pointers we got from
@@ -3191,11 +3200,21 @@ delete_transaction( fd_pack_t         * pack,
       }
     }
 
-    if( FD_LIKELY( best ) ) {
-      /* move best to the main treap */
-      treap_ele_remove( best_penalty->penalty_treap, best, pack->pool );
-      fd_pack_insert_pending( pack, best );
 
+    if( FD_LIKELY( best ) ) {
+      /* move best to the main treap.
+         PEBBLE: or park it if arrived late; keep promoting from the
+         same penalty treap until an eligible txn reaches pending.
+         Transactions parked this way return to pending treap when
+         the auction is over instead of their penalty treap, but
+         the impact on performance should be limited. */
+      for(;;) {
+        treap_ele_remove( best_penalty->penalty_treap, best, pack->pool );
+        fd_pack_insert_pending( pack, best );
+        if( FD_LIKELY( best->root!=FD_ORD_TXN_ROOT_PENDING_LATE ) ) break;
+        if( FD_UNLIKELY( !treap_ele_cnt( best_penalty->penalty_treap ) ) ) break;
+        best = treap_rev_iter_ele( treap_rev_iter_init( best_penalty->penalty_treap, pack->pool ), pack->pool );
+      }
       if( FD_UNLIKELY( !treap_ele_cnt( best_penalty->penalty_treap ) ) ) {
         treap_delete( treap_leave( best_penalty->penalty_treap ) );
         penalty_map_remove( pack->penalty_treaps, best_penalty );
