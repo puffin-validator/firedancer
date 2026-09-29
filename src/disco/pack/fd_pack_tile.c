@@ -246,6 +246,11 @@ typedef struct {
 
   ulong    execle_cnt;
   ulong    execle_idle_bitset; /* bit i is 1 if we've observed *execle_current[i]==execle_expect[i] */
+
+  /* PEBBLE: execle tiles running a microblock whose completion may
+     promote eligible txns from penalty treaps (in-auction or bundle). */
+  ulong auction_busy_bitset;
+
   int      poll_cursor; /* in [0, execle_cnt), the next execle to poll */
   int      use_consumed_cus;
   long     skip_cnt;
@@ -700,6 +705,7 @@ after_credit( fd_pack_ctx_t *     ctx,
         (fd_fseq_query( ctx->execle_current[poll_cursor] )==ctx->execle_expect[poll_cursor]) ) ) {
       *charge_busy = 1;
       ctx->execle_idle_bitset |= 1UL<<poll_cursor;
+      ctx->auction_busy_bitset &= ~(1UL<<poll_cursor);
 
       long complete_duration = -fd_tickcount();
       int completed = fd_pack_microblock_complete( ctx->pack, (ulong)poll_cursor );
@@ -730,6 +736,7 @@ after_credit( fd_pack_ctx_t *     ctx,
     ctx->leader_slot         = ULONG_MAX;
     ctx->slot_microblock_cnt = 0UL;
     ctx->in_auction_cnt      = 0U; /* PEBBLE */
+    ctx->auction_busy_bitset = 0UL; /* PEBBLE */
 
     remove_ib( ctx );
 
@@ -1050,6 +1057,8 @@ after_credit( fd_pack_ctx_t *     ctx,
       trailer->pack_txn_idx = ctx->pack_txn_cnt;
       trailer->is_bundle = !!(microblock_dst->txnp->flags & FD_TXN_P_FLAGS_BUNDLE);
 
+      ctx->auction_busy_bitset |= fd_ulong_if( schedule_res.in_auction | trailer->is_bundle, 1UL<<i, 0UL );
+
       /* When sending MAX_TXN_PER_MICROBLOCK transactions as fd_txn_e_t
          to execle, there must be room for the trailer at the end. */
       FD_STATIC_ASSERT( MAX_TXN_PER_MICROBLOCK*sizeof(fd_txn_e_t)+sizeof(fd_microblock_execle_trailer_t)<=MAX_MICROBLOCK_SZ, pack_execle_mtu );
@@ -1077,12 +1086,13 @@ after_credit( fd_pack_ctx_t *     ctx,
          schedule attempt. */
       fd_long_store_if( ctx->use_consumed_cus, &(ctx->skip_cnt), (long)(ctx->execle_cnt + 1) );
     }
-    /* PEBBLE: if we are conducting an auction, check if we must end it
-       because no more txs are available.
-       The final auction (state 2) is never ended before the slot
-       ends. */
-    if( FD_UNLIKELY( schedule_res.auction_stop && fd_pack_auction_ongoing( ctx->pack )==FD_PACK_AUCTION_REGULAR ) ) {
-      FD_LOG_INFO(( "auction %ld end: consumed %lu cu, no more txs", ctx->auction_idx, fd_pack_current_consumed(ctx->pack) ));
+    /* PEBBLE: a regular auction is over when the last scan found no
+       eligible txn, and no in-flight microblock can still promote one
+       from a penalty treap. */
+    if( FD_UNLIKELY( schedule_res.auction_stop &&
+                     !ctx->auction_busy_bitset &&
+                     fd_pack_auction_ongoing( ctx->pack )==FD_PACK_AUCTION_REGULAR ) ) {
+      FD_LOG_INFO(( "auction %ld end: consumed %lu cu, no more txs", ctx->auction_idx, fd_pack_current_consumed( ctx->pack ) ));
       end_auction( ctx, stem );
     }
   }
@@ -1130,6 +1140,7 @@ after_credit( fd_pack_ctx_t *     ctx,
     ctx->leader_slot         = ULONG_MAX;
     ctx->slot_microblock_cnt = 0UL;
     ctx->in_auction_cnt      = 0U; /* PEBBLE */
+    ctx->auction_busy_bitset = 0UL; /* PEBBLE */
     remove_ib( ctx );
 
     return;
@@ -1382,6 +1393,7 @@ after_frag( fd_pack_ctx_t *     ctx,
       ctx->leader_slot         = ULONG_MAX;
       ctx->slot_microblock_cnt = 0UL;
       ctx->in_auction_cnt      = 0U; /* PEBBLE */
+      ctx->auction_busy_bitset = 0UL; /* PEBBLE */
       remove_ib( ctx );
     }
     ctx->leader_slot = leader_slot;
@@ -1723,6 +1735,7 @@ unprivileged_init( fd_topo_t const *      topo,
   ctx->auctions_per_slot             = tile->pack.auctions_per_slot;
   ctx->auction_period_ns             = 0UL; /* Set when becoming leader */
   ctx->in_auction_cnt                = 0U;
+  ctx->auction_busy_bitset           = 0UL; /* PEBBLE */
   ctx->next_auction_ns               = 0L;
   ctx->last_bundle_auction_ticks     = (long)(tick_per_ns * 5000000.0); /* 5ms */
   ctx->last_bundle_received_ticks    = LONG_MAX; /* Don't start auctions before receiving first bundle */
