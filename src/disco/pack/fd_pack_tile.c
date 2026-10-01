@@ -1353,6 +1353,8 @@ after_frag( fd_pack_ctx_t *     ctx,
         ctx->drain_execle        = 1;
         ctx->leader_slot         = ULONG_MAX;
         ctx->slot_microblock_cnt = 0UL;
+        ctx->in_auction_cnt      = 0U; /* PEBBLE */
+        ctx->auction_busy_bitset = 0UL; /* PEBBLE */
         remove_ib( ctx );
 
         update_metric_state( ctx, now, FD_PACK_METRIC_STATE_LEADER,       0 );
@@ -1395,14 +1397,14 @@ after_frag( fd_pack_ctx_t *     ctx,
       ctx->drain_execle        = 1;
       ctx->leader_slot         = ULONG_MAX;
       ctx->slot_microblock_cnt = 0UL;
-      ctx->in_auction_cnt      = 0U; /* PEBBLE */
-      ctx->auction_busy_bitset = 0UL; /* PEBBLE */
       remove_ib( ctx );
     }
     ctx->leader_slot = leader_slot;
 
     ctx->slot_pack_start_ns  = now_ns;
     ctx->slot_bundle_txn_cnt = 0UL;
+    ctx->in_auction_cnt      = 0U; /* PEBBLE */
+    ctx->auction_busy_bitset = 0UL; /* PEBBLE */
 
     ulong exp_cnt = fd_pack_expire_before( ctx->pack, fd_ulong_max( ctx->leader_slot, TRANSACTION_LIFETIME_SLOTS )-TRANSACTION_LIFETIME_SLOTS );
     FD_MCNT_INC( PACK, TXN_EXPIRED, exp_cnt );
