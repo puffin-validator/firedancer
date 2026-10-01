@@ -974,7 +974,10 @@ after_credit( fd_pack_ctx_t *     ctx,
                even in the edge cases where no standard auctions have
                started.
                Since Jito conducts auctions every 50ms, we also require
-               that last auction started at least 8*5 = 40ms before. */
+               that last auction started at least 8*5 = 40ms before.
+               See also data provision for padding when we become
+               leader, that assumes the minimum interval between
+               auctions is 40ms. */
             if( FD_UNLIKELY( now - ctx->last_bundle_auction_ticks > ctx->last_bundle_received_ticks ) ) {
               ctx->last_bundle_received_ticks = LONG_MAX; /* No more auction start until a new bundle is received */
               if( FD_LIKELY( now > ctx->last_auction_start_ticks + (ctx->last_bundle_auction_ticks << 3 ) ) ) {
@@ -1460,9 +1463,11 @@ after_frag( fd_pack_ctx_t *     ctx,
         ctx->cu_per_auction = (ctx->limits.slot_max_cost + ctx->auctions_per_slot - 1) / ctx->auctions_per_slot;
         ctx->auction_idx_last = (long)ctx->auctions_per_slot - 1;
         ctx->auction_end_cu = 0UL;
+        ctx->slot_max_data -= FD_SHREDDER_CHAINED_FEC_SET_PAYLOAD_SZ * ctx->auctions_per_slot;
       } else {
         ctx->last_auction_start_ticks = 0L;
         ctx->last_bundle_received_ticks = LONG_MAX; /* Don't start auctions before receiving first bundle. */
+        ctx->slot_max_data -= FD_SHREDDER_CHAINED_FEC_SET_PAYLOAD_SZ * (ulong) ( 1L + (ctx->_became_leader->slot_end_ns - ctx->_became_leader->slot_start_ns) / 40000000L );
       }
       ctx->auction_idx = -1;
     }
