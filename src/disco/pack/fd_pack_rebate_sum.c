@@ -144,7 +144,7 @@ fd_pack_rebate_sum_add_txn( fd_pack_rebate_sum_t         * s,
 ulong
 fd_pack_rebate_sum_report( fd_pack_rebate_sum_t * s,
                            fd_pack_rebate_t     * out ) {
-  if( FD_UNLIKELY( (s->ib_result==0) & (s->total_cost_rebate==0UL) & (s->writer_cnt==0U) ) ) return 0UL;
+  if( FD_UNLIKELY( (s->ib_result==0) & (s->total_cost_rebate==0UL) & (s->writer_cnt==0U) & (s->total_consumed==0UL) ) ) return 0UL;
   out->total_cost_rebate       = s->total_cost_rebate;          s->total_cost_rebate       = 0UL;
   out->total_consumed          = s->total_consumed;             s->total_consumed          = 0U; /* PEBBLE */
   out->vote_cost_rebate        = s->vote_cost_rebate;           s->vote_cost_rebate        = 0U; /* PEBBLE: changed to uint */
