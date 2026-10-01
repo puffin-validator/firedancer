@@ -297,6 +297,7 @@ handle_microblock( fd_execle_tile_t *  ctx,
   trailer->txn_ns_dt        = (fd_txn_ns_dt_t){0};
   trailer->bank_seq         = bank->bank_seq;
   trailer->exec_end_ticks   = LONG_MAX;
+  trailer->in_auction = ctx->_in_auction; /* PEBBLE */
 
   /* exec_start_ticks is the first transaction's load_start_ticks (an
      empty microblock reads the clock itself); microblock_start_ticks
@@ -423,8 +424,6 @@ handle_microblock( fd_execle_tile_t *  ctx,
     trailer->txn_ns_dt.commit_start = fd_float_if( txn_out->details.commit_start_ticks==LONG_MAX, trailer->txn_ns_dt.exec_start,   (float)fd_long_max( 0L, txn_out->details.commit_start_ticks - microblock_start_ticks ) * ctx->ns_per_tick );
     trailer->txn_ns_dt.commit_end   = fd_float_if( txn_end_ticks==LONG_MAX,                       trailer->txn_ns_dt.commit_start, (float)fd_long_max( 0L, txn_end_ticks                       - microblock_start_ticks ) * ctx->ns_per_tick );
     trailer->exec_end_ticks         = txn_end_ticks;
-
-    trailer->in_auction = ctx->_in_auction; /* PEBBLE */
 
     if( FD_UNLIKELY( !txn_out->err.is_committable ) ) {
       /* If the transaction failed to fit into the block, we need to
