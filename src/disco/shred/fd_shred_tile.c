@@ -738,6 +738,12 @@ during_frag( fd_shred_ctx_t * ctx,
         ctx->batch_cnt                    = 0UL;
 
         FD_MCNT_INC( SHRED, MICROBLOCK_ABANDONED, 1UL );
+
+        /* PEBBLE: if we are in a bare flush request, do nothing. */
+        if( FD_UNLIKELY( entry_sz==0 ) ) {
+          ctx->skip_frag = 1;
+          return;
+        }
       }
 
       ctx->pending_batch.slot = target_slot;
