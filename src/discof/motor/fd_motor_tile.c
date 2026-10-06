@@ -321,8 +321,9 @@ before_frag( fd_motor_tile_t * ctx,
   case IN_KIND_PACK:
     /* PEBBLE: FLUSH requests only carry the low 16 bits of the slot.
        DONE_DRAINING and REDUCE_MB_BOUND stay filtered. */
-    if( FD_UNLIKELY( sig>=FD_PACK_MSG_FLUSH && sig<FD_PACK_MSG_REDUCE_MB_BOUND ) )
-      return fd_disco_poh_sig_flush_slot16( sig )!=(ctx->slot & 0xFFFFUL);
+    if( FD_UNLIKELY( sig==FD_PACK_MSG_DONE_DRAINING || sig==FD_PACK_MSG_REDUCE_MB_BOUND ) ) return 1;
+    if( FD_UNLIKELY( sig>=FD_PACK_MSG_FLUSH ) )
+        return fd_disco_poh_sig_flush_slot16( sig )!=(ctx->slot & 0xFFFFUL);
     __attribute__((fallthrough));
   case IN_KIND_EXECLE: {
     ulong slot = fd_disco_execle_sig_slot( sig );
